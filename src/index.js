@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import { joinVoiceChannel } from '@discordjs/voice';
 import { startRecording, stopRecording } from './recorder.js';
-import { sendResults } from './delivery.js';
+import { sendResults, notifyRecordingStart, notifyRecordingEnd } from './delivery.js';
 import { ensureDir } from './utils.js';
 
 const client = new Client({
@@ -11,6 +11,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -36,17 +37,23 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     const voiceChannel = member.voice.channel;
+    
+    console.log(`🔌 Joining voice channel: ${voiceChannel.name} (${voiceChannel.id})`);
+    console.log(`🔐 Channel is E2E encrypted: ${voiceChannel.guild.features.includes('ENCRYPTED_VOICE_CHANNELS') ? 'YES' : 'NO'}`);
+    
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: voiceChannel.guild.id,
       adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       selfDeaf: false,
-      selfMute: true,
+      selfMute: false, // Меняем на false чтобы слышать
+      debug: true,
     });
 
     const recordingDir = await ensureDir(process.env.AUDIO_OUTPUT_DIR || './recordings');
     activeRecording = await startRecording(connection, voiceChannel, recordingDir);
 
+    await notifyRecordingStart(voiceChannel);
     await message.reply(`Подключился к ${voiceChannel.name} и начал многоканальную запись.`);
   }
 
@@ -58,6 +65,7 @@ client.on(Events.MessageCreate, async (message) => {
     const session = activeRecording;
     activeRecording = null;
 
+    await notifyRecordingEnd();
     await message.reply('Останавливаю запись и запускаю обработку. Это может занять несколько минут.');
 
     try {

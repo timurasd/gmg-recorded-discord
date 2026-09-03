@@ -1,29 +1,30 @@
-import axios from 'axios';
+import Anthropic from '@anthropic-ai/sdk';
 
 /**
- * Сгенерировать сводку по расшифровке через локальную LLM (Ollama).
+ * Сгенерировать сводку по расшифровке через Claude API.
  */
 export async function summarizeTranscript(transcript) {
   const prompt = buildSummaryPrompt(transcript);
-  const url = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
-  const model = process.env.OLLAMA_MODEL || 'llama3.2';
+  const anthropic = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+  });
 
-  const { data } = await axios.post(
-    url,
-    {
-      model,
-      prompt,
-      stream: false,
-      options: {
-        temperature: 0.2,
-      },
-    },
-    {
-      timeout: 300000,
-    },
-  );
+  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 
-  return data.response || data.content || '';
+  console.log(`🤖 Generating summary via Claude (${model})...`);
+
+  const message = await anthropic.messages.create({
+    model,
+    max_tokens: 2048,
+    temperature: 0.2,
+    messages: [{
+      role: 'user',
+      content: prompt
+    }]
+  });
+
+  console.log(`✅ Summary generated, length: ${message.content[0].text.length} chars`);
+  return message.content[0].text;
 }
 
 function buildSummaryPrompt(transcript) {

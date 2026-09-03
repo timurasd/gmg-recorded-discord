@@ -3,6 +3,56 @@ import fs from 'fs/promises';
 import path from 'path';
 
 /**
+ * Notify Telegram that recording has started
+ */
+export async function notifyRecordingStart(voiceChannel) {
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!chatId || !token) return;
+
+  const message = `🔴 *Запись началась*\n\n📢 Канал: ${voiceChannel.name}\n🆔 ID: ${voiceChannel.id}`;
+  
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'Markdown',
+      },
+    );
+    console.log('✅ Telegram: уведомление о начале записи отправлено');
+  } catch (err) {
+    console.error('❌ Telegram: ошибка при отправке уведомления о начале:', err.message);
+  }
+}
+
+/**
+ * Notify Telegram that recording has ended and processing started
+ */
+export async function notifyRecordingEnd() {
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!chatId || !token) return;
+
+  const message = `⏸️ *Запись остановлена*\n\n⏳ Обработка началась (транскрипция + саммаризация)...`;
+  
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'Markdown',
+      },
+    );
+    console.log('✅ Telegram: уведомление об окончании записи отправлено');
+  } catch (err) {
+    console.error('❌ Telegram: ошибка при отправке уведомления об окончании:', err.message);
+  }
+}
+
+/**
  * Отправить сводку и полную расшифровку в Discord и Telegram.
  */
 export async function sendResults(result) {
@@ -15,14 +65,24 @@ export async function sendResults(result) {
   await fs.writeFile(summaryPath, summary, 'utf-8');
 
   await sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath);
-  await sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath);
+  await sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir);
 }
 
 async function sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath) {
   const channelId = process.env.DISCORD_SUMMARY_CHANNEL_ID;
   if (!channelId) return;
 
-  const discordMessage = `**Сводка созвона** (${formatDuration(durationSec)})\n\n${summary}`;
+  // Discord limit: 2000 chars. If summary is too long, just send a short message
+  const MAX_LENGTH = 1800; // leave some space for header
+  let discordMessage;
+  
+  if (summary.length > MAX_LENGTH) {
+    // Send short notification + files
+    discordMessage = `**Сводка созвона** (${formatDuration(durationSec)})\n\n✅ Обработка завершена. Полная сводка в прикреплённых файлах.`;
+  } else {
+    // Send full summary if it fits
+    discordMessage = `**Сводка созвона** (${formatDuration(durationSec)})\n\n${summary}`;
+  }
 
   await sendDiscordMessage(channelId, discordMessage);
 
@@ -62,35 +122,87 @@ async function sendDiscordFile(channelId, filePath, filename) {
   );
 }
 
-async function sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath) {
+async function sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!chatId || !token) return;
+  if (!chatId || !token) {
+    console.log('⚠️ Telegram: нет TELEGRAM_CHAT_ID или TELEGRAM_BOT_TOKEN, пропускаю');
+    return;
+  }
 
-  const message = `*Сводка созвона* (${formatDuration(durationSec)})\n\n${summary}`;
-  await axios.post(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    {
-      chat_id: chatId,
-      text: message,
-      parse_mode: 'Markdown',
-    },
-  );
+  console.log('📤 Telegram: отправка результатов...');
 
-  for (const file of [summaryPath, transcriptPath]) {
-    const filename = path.basename(file);
-    const form = new (await import('form-data')).default();
-    form.append('document', await fs.readFile(file), { filename });
-    form.append('chat_id', chatId);
-
+  // Send completion notification
+  const notificationMessage = `✅ *Обработка завершена* (${formatDuration(durationSec)})\n\n📄 Отправляю файлы...`;
+  try {
     await axios.post(
-      `https://api.telegram.org/bot${token}/sendDocument`,
-      form,
+      `https://api.telegram.org/bot${token}/sendMessage`,
       {
-        headers: form.getHeaders(),
+        chat_id: chatId,
+        text: notificationMessage,
+        parse_mode: 'Markdown',
       },
     );
+  } catch (err) {
+    console.error('❌ Telegram: ошибка при отправке уведомления о завершении:', err.message);
   }
+
+  // Send summary and transcript files
+  for (const file of [summaryPath, transcriptPath]) {
+    const filename = path.basename(file);
+    console.log(`📄 Telegram: отправка ${filename}...`);
+    try {
+      const form = new (await import('form-data')).default();
+      form.append('document', await fs.readFile(file), { filename });
+      form.append('chat_id', chatId);
+
+      await axios.post(
+        `https://api.telegram.org/bot${token}/sendDocument`,
+        form,
+        {
+          headers: form.getHeaders(),
+        },
+      );
+      console.log(`✅ Telegram: ${filename} отправлен`);
+    } catch (err) {
+      console.error(`❌ Telegram: ошибка при отправке ${filename}:`, err.message);
+    }
+  }
+
+  // Send all WAV files from transcripts/ directory
+  const transcriptsDir = path.join(sessionDir, 'transcripts');
+  try {
+    const files = await fs.readdir(transcriptsDir);
+    const wavFiles = files.filter(f => f.endsWith('.wav'));
+    
+    console.log(`🎵 Telegram: найдено ${wavFiles.length} WAV файлов`);
+    
+    for (const wavFile of wavFiles) {
+      const wavPath = path.join(transcriptsDir, wavFile);
+      console.log(`🎵 Telegram: отправка ${wavFile}...`);
+      
+      try {
+        const form = new (await import('form-data')).default();
+        form.append('document', await fs.readFile(wavPath), { filename: wavFile });
+        form.append('chat_id', chatId);
+
+        await axios.post(
+          `https://api.telegram.org/bot${token}/sendDocument`,
+          form,
+          {
+            headers: form.getHeaders(),
+          },
+        );
+        console.log(`✅ Telegram: ${wavFile} отправлен`);
+      } catch (err) {
+        console.error(`❌ Telegram: ошибка при отправке ${wavFile}:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Telegram: ошибка при чтении WAV файлов:', err.message);
+  }
+
+  console.log('✅ Telegram: все файлы отправлены');
 }
 
 function formatDuration(seconds) {

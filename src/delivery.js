@@ -3,6 +3,16 @@ import fs from 'fs/promises';
 import path from 'path';
 
 /**
+ * Escape HTML special characters
+ */
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
  * Notify Telegram that recording has started
  */
 export async function notifyRecordingStart(voiceChannel) {
@@ -10,7 +20,8 @@ export async function notifyRecordingStart(voiceChannel) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!chatId || !token) return;
 
-  const message = `🔴 *Запись началась*\n\n📢 Канал: ${voiceChannel.name}\n🆔 ID: ${voiceChannel.id}`;
+  const channelName = escapeHtml(voiceChannel.name);
+  const message = `🔴 <b>Запись началась</b>\n\n📢 Канал: ${channelName}\n🆔 ID: ${voiceChannel.id}`;
   
   try {
     await axios.post(
@@ -18,7 +29,7 @@ export async function notifyRecordingStart(voiceChannel) {
       {
         chat_id: chatId,
         text: message,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
       },
     );
     console.log('✅ Telegram: уведомление о начале записи отправлено');
@@ -35,7 +46,7 @@ export async function notifyRecordingEnd() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!chatId || !token) return;
 
-  const message = `⏸️ *Запись остановлена*\n\n⏳ Обработка началась (транскрипция + саммаризация)...`;
+  const message = `⏸️ <b>Запись остановлена</b>\n\n⏳ Обработка началась (транскрипция + саммаризация)...`;
   
   try {
     await axios.post(
@@ -43,7 +54,7 @@ export async function notifyRecordingEnd() {
       {
         chat_id: chatId,
         text: message,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
       },
     );
     console.log('✅ Telegram: уведомление об окончании записи отправлено');
@@ -133,14 +144,14 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
   console.log('📤 Telegram: отправка результатов...');
 
   // Send completion notification
-  const notificationMessage = `✅ *Обработка завершена* (${formatDuration(durationSec)})\n\n📄 Отправляю файлы...`;
+  const notificationMessage = `✅ <b>Обработка завершена</b> (${formatDuration(durationSec)})\n\n📄 Отправляю файлы...`;
   try {
     await axios.post(
       `https://api.telegram.org/bot${token}/sendMessage`,
       {
         chat_id: chatId,
         text: notificationMessage,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
       },
     );
   } catch (err) {

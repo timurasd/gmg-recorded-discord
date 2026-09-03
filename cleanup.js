@@ -25,7 +25,7 @@ async function sendTelegram(message) {
       {
         chat_id: chatId,
         text: message,
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
       },
     );
     console.log('✅ Telegram уведомление отправлено');
@@ -131,7 +131,7 @@ async function cleanup() {
         await fs.rm(sessionPath, { recursive: true, force: true });
         
         await sendTelegram(
-          `🗑️ *Запись удалена*\n\n` +
+          `🗑️ <b>Запись удалена</b>\n\n` +
           `📅 Дата: ${formatDate(sessionTimestamp)}\n` +
           `⏱️ Возраст: ${ageDays} дней\n` +
           `💾 Размер: ${sizeMB} MB\n` +
@@ -149,7 +149,7 @@ async function cleanup() {
         console.log(`⚠️ Предупреждение для ${entry.name} (удалю через ${hoursLeft}ч)`);
         
         await sendTelegram(
-          `⚠️ *Запись будет удалена через ${hoursLeft}ч*\n\n` +
+          `⚠️ <b>Запись будет удалена через ${hoursLeft}ч</b>\n\n` +
           `📅 Дата: ${formatDate(sessionTimestamp)}\n` +
           `⏱️ Возраст: ${ageDays} дней\n` +
           `💾 Размер: ${sizeMB} MB\n` +
@@ -164,7 +164,7 @@ async function cleanup() {
     console.error('❌ Ошибка при очистке:', err);
     
     await sendTelegram(
-      `❌ *Ошибка очистки записей*\n\n` +
+      `❌ <b>Ошибка очистки записей</b>\n\n` +
       `${err.message}`
     );
   }

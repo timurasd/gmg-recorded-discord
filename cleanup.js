@@ -90,6 +90,16 @@ async function cleanup() {
   console.log(`📁 Папка: ${RECORDINGS_DIR}`);
   
   try {
+    // Создать папку recordings если её нет
+    try {
+      await fs.access(RECORDINGS_DIR);
+    } catch {
+      console.log('📁 Папка recordings не существует, создаю...');
+      await fs.mkdir(RECORDINGS_DIR, { recursive: true });
+      console.log('✅ Папка recordings создана');
+      return;
+    }
+    
     const entries = await fs.readdir(RECORDINGS_DIR, { withFileTypes: true });
     const now = Date.now();
     
@@ -125,7 +135,7 @@ async function cleanup() {
           `📅 Дата: ${formatDate(sessionTimestamp)}\n` +
           `⏱️ Возраст: ${ageDays} дней\n` +
           `💾 Размер: ${sizeMB} MB\n` +
-          `📂 ID: \`${entry.name}\``
+          `📂 ID: ${entry.name}`
         );
         
         console.log(`✅ Запись ${entry.name} удалена`);
@@ -143,7 +153,7 @@ async function cleanup() {
           `📅 Дата: ${formatDate(sessionTimestamp)}\n` +
           `⏱️ Возраст: ${ageDays} дней\n` +
           `💾 Размер: ${sizeMB} MB\n` +
-          `📂 ID: \`${entry.name}\`\n\n` +
+          `📂 ID: ${entry.name}\n\n` +
           `Если нужна запись — скачай файлы с сервера сейчас.`
         );
       }
@@ -155,7 +165,7 @@ async function cleanup() {
     
     await sendTelegram(
       `❌ *Ошибка очистки записей*\n\n` +
-      `\`${err.message}\``
+      `${err.message}`
     );
   }
 }

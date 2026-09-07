@@ -10,6 +10,7 @@ const projectRoot = path.resolve(__dirname, '..');
 
 // Store message IDs for editing
 let progressMessageId = null;
+let currentSessionInfo = null;
 
 /**
  * Escape HTML special characters
@@ -126,6 +127,7 @@ export async function notifyRecordingEnd(sessionInfo) {
     );
     console.log('✅ Telegram: уведомление об окончании записи отправлено');
     progressMessageId = response.data?.result?.message_id;
+    currentSessionInfo = sessionInfo;
     return progressMessageId;
   } catch (err) {
     console.error('❌ Telegram: ошибка при отправке уведомления об окончании:', err.message);
@@ -148,8 +150,14 @@ export async function updateProgress(percent, currentUser = '', status = 'transc
     ? `🤖 Генерирую саммари...`
     : `✅ Готово!`;
   
+  // Build session info line
+  const sessionLine = currentSessionInfo 
+    ? `Запись: ${currentSessionInfo.durationMin} мин, ${currentSessionInfo.speakerCount} спикер(ов). Займёт ~${currentSessionInfo.estimatedMin} мин.`
+    : '';
+  
   const message = [
     `⏳ <b>Обработка записи</b>`,
+    sessionLine,
     ``,
     `<code>${progressBar}</code>`,
     ``,
@@ -366,8 +374,9 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
 
   console.log('✅ Telegram: все файлы отправлены');
   
-  // Reset progress message ID
+  // Reset state
   progressMessageId = null;
+  currentSessionInfo = null;
 }
 
 function formatDuration(seconds) {

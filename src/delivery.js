@@ -22,21 +22,7 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-/**
- * Get next meeting number
- */
-async function getNextMeetingNumber() {
-  const counterFile = path.join(projectRoot, 'meeting_counter.txt');
-  try {
-    const data = await fs.readFile(counterFile, 'utf-8');
-    const num = parseInt(data.trim(), 10) + 1;
-    await fs.writeFile(counterFile, String(num), 'utf-8');
-    return num;
-  } catch {
-    await fs.writeFile(counterFile, '1', 'utf-8');
-    return 1;
-  }
-}
+
 
 /**
  * Format file size
@@ -194,13 +180,11 @@ export async function sendResults(result) {
   await fs.writeFile(transcriptPath, transcript, 'utf-8');
   await fs.writeFile(summaryPath, summary, 'utf-8');
 
-  const meetingNumber = await getNextMeetingNumber();
-
-  await sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, meetingNumber, participants);
-  await sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, meetingNumber, participants);
+  await sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, participants);
+  await sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, participants);
 }
 
-async function sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, meetingNumber, participants) {
+async function sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, participants) {
   const channelId = process.env.DISCORD_SUMMARY_CHANNEL_ID;
   if (!channelId) return;
 
@@ -213,7 +197,7 @@ async function sendToDiscord(summary, transcript, durationSec, transcriptPath, s
   const MAX_LENGTH = 1600;
   
   const header = [
-    `**Встреча #${meetingNumber}**`,
+    `**Сводка созвона**`,
     `👥 Участники: ${participantList}`,
     `⏱ Длительность: ${formatDuration(durationSec)}`,
     `💬 Обсуждение: ${discussionLine}`,
@@ -280,7 +264,7 @@ async function sendDiscordFile(channelId, filePath, filename) {
   );
 }
 
-async function sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, meetingNumber, participants) {
+async function sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, participants) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!chatId || !token) {
@@ -303,7 +287,7 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
 
   // Send final summary message
   const finalMessage = [
-    `✅ <b>Встреча #${meetingNumber}</b>`,
+    `✅ <b>Сводка созвона</b>`,
     ``,
     `👥 Участники: ${participantList}`,
     `⏱ Длительность: ${formatDuration(durationSec)}`,
@@ -373,6 +357,14 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
   }
 
   console.log('✅ Telegram: все файлы отправлены');
+  
+  // Cleanup: delete session directory after successful delivery
+  try {
+    await fs.rm(sessionDir, { recursive: true, force: true });
+    console.log(`🗑️ Deleted session directory: ${sessionDir}`);
+  } catch (err) {
+    console.error(`❌ Failed to delete session directory: ${err.message}`);
+  }
   
   // Reset state
   progressMessageId = null;

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import { joinVoiceChannel } from '@discordjs/voice';
-import { startRecording, stopRecording } from './recorder.js';
+import { startRecording, stopRecording, getSessionInfo } from './recorder.js';
 import { sendResults, notifyRecordingStart, notifyRecordingEnd } from './delivery.js';
 import { ensureDir } from './utils.js';
 
@@ -53,7 +53,12 @@ client.on(Events.MessageCreate, async (message) => {
     const recordingDir = await ensureDir(process.env.AUDIO_OUTPUT_DIR || './recordings');
     activeRecording = await startRecording(connection, voiceChannel, recordingDir);
 
-    await notifyRecordingStart(voiceChannel);
+    // Get participant names (excluding bots)
+    const participants = voiceChannel.members
+      .filter(m => !m.user.bot)
+      .map(m => m.displayName || m.user.username);
+
+    await notifyRecordingStart(voiceChannel, participants);
     await message.reply(`Подключился к ${voiceChannel.name} и начал многоканальную запись.`);
   }
 
@@ -65,8 +70,11 @@ client.on(Events.MessageCreate, async (message) => {
     const session = activeRecording;
     activeRecording = null;
 
-    await notifyRecordingEnd();
-    await message.reply('Останавливаю запись и запускаю обработку. Это может занять несколько минут.');
+    // Get session info for the end message
+    const sessionInfo = await getSessionInfo(session);
+    
+    await notifyRecordingEnd(sessionInfo);
+    await message.reply(`Останавливаю запись (${sessionInfo.durationMin} мин, ${sessionInfo.speakerCount} спикеров). Обработка займёт ~${sessionInfo.estimatedMin} мин.`);
 
     try {
       const result = await stopRecording(session);

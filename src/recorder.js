@@ -1,5 +1,6 @@
 import { VoiceConnectionStatus, entersState } from '@discordjs/voice';
 import { createWriteStream } from 'fs';
+import fs from 'fs/promises';
 import { pipeline } from 'stream';
 import { promisify } from 'util';
 import path from 'path';
@@ -7,6 +8,7 @@ import prism from 'prism-media';
 import { ensureDir, sleep } from './utils.js';
 import { transcribeSession } from './transcribe.js';
 import { summarizeTranscript } from './summarize.js';
+import { updateProgress } from './delivery.js';
 
 const pipelineAsync = promisify(pipeline);
 
@@ -19,12 +21,18 @@ export async function startRecording(connection, voiceChannel, outputDir) {
   await ensureDir(sessionDir);
 
   const userStreams = new Map();
+  const userNames = new Map(); // userId -> display name
   const startTime = Date.now();
 
   console.log(`📁 Session directory: ${sessionDir}`);
   console.log(`👥 Users in voice channel: ${voiceChannel.members.size}`);
+  
+  // Collect initial participants (excluding bots)
   voiceChannel.members.forEach(member => {
-    console.log(`   - ${member.user.tag} (${member.id})`);
+    if (!member.user.bot) {
+      userNames.set(member.id, member.displayName || member.user.username);
+      console.log(`   - ${member.displayName} (${member.id})`);
+    }
   });
 
   connection.on('stateChange', (oldState, newState) => {
@@ -129,7 +137,41 @@ export async function startRecording(connection, voiceChannel, outputDir) {
     voiceChannel,
     sessionDir,
     userStreams,
+    userNames,
     startTime,
+  };
+}
+
+/**
+ * Get session info for progress messages
+ */
+export async function getSessionInfo(session) {
+  const { userStreams, userNames, startTime } = session;
+  
+  const durationMin = Math.round((Date.now() - startTime) / 60000);
+  const speakerCount = userStreams.size;
+  const participants = Array.from(userNames.values());
+  
+  // Calculate total file size
+  let totalSize = 0;
+  for (const [, info] of userStreams.entries()) {
+    try {
+      const stats = await fs.stat(info.pcmFile);
+      totalSize += stats.size;
+    } catch {}
+  }
+  
+  // Estimate WAV size (PCM 48kHz stereo -> WAV 16kHz mono = ~6x smaller)
+  const estimatedWavSize = totalSize / 6;
+  // Estimate: 1MB WAV ≈ 30 sec transcription on CPU with small model
+  const estimatedMin = Math.ceil(Math.max(1, (estimatedWavSize / 1024 / 1024) * 0.5));
+  
+  return {
+    durationMin,
+    speakerCount,
+    totalSize,
+    estimatedMin,
+    participants,
   };
 }
 
@@ -137,7 +179,7 @@ export async function startRecording(connection, voiceChannel, outputDir) {
  * Остановить запись и запустить транскрипцию + summary.
  */
 export async function stopRecording(session) {
-  const { connection, userStreams, sessionDir, startTime } = session;
+  const { connection, userStreams, userNames, sessionDir, startTime } = session;
 
   console.log(`🛑 Stopping recording, ${userStreams.size} users recorded`);
 
@@ -165,7 +207,8 @@ export async function stopRecording(session) {
 
   const userFiles = [];
   for (const [userId, info] of userStreams.entries()) {
-    userFiles.push({ userId, pcmFile: info.pcmFile, startOffset: info.start - startTime });
+    const userName = userNames.get(userId) || `User_${userId}`;
+    userFiles.push({ userId, userName, pcmFile: info.pcmFile, startOffset: info.start - startTime });
   }
 
   if (userFiles.length === 0) {
@@ -173,15 +216,31 @@ export async function stopRecording(session) {
   }
 
   console.log(`📝 Transcribing ${userFiles.length} user(s)...`);
-  const transcript = await transcribeSession(userFiles, sessionDir);
+  
+  // Update progress: 0% starting transcription
+  await updateProgress(0, '', 'transcribing');
+  
+  const transcript = await transcribeSession(userFiles, sessionDir, async (progress, userName) => {
+    await updateProgress(progress, userName, 'transcribing');
+  });
 
+  // Update progress: 90% summarizing
+  await updateProgress(90, '', 'summarizing');
+  
   console.log('🤖 Summarizing...');
   const summary = await summarizeTranscript(transcript);
+  
+  // Update progress: 100% done
+  await updateProgress(100, '', 'done');
+
+  // Get participant names
+  const participants = Array.from(userNames.values());
 
   return {
     sessionDir,
     transcript,
     summary,
+    participants,
     durationSec: Math.round((Date.now() - startTime) / 1000),
   };
 }

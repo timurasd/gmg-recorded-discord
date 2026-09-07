@@ -92,16 +92,26 @@ export async function transcribeAudio(wavFile, language = 'ru') {
  * Транскрибировать все файлы участников и собрать единую расшифровку
  * с временными метками и идентификаторами спикеров.
  */
-export async function transcribeSession(userFiles, sessionDir) {
+export async function transcribeSession(userFiles, sessionDir, onProgress = null) {
   const transcriptsDir = path.join(sessionDir, 'transcripts');
   await ensureDir(transcriptsDir);
 
   const segments = [];
+  const totalUsers = userFiles.length;
 
-  console.log(`📝 Transcribing ${userFiles.length} user(s)...`);
+  console.log(`📝 Transcribing ${totalUsers} user(s)...`);
 
-  for (const { userId, pcmFile, startOffset } of userFiles) {
-    console.log(`\n👤 Processing user ${userId}...`);
+  for (let i = 0; i < userFiles.length; i++) {
+    const { userId, userName, pcmFile, startOffset } = userFiles[i];
+    const displayName = userName || `User_${userId}`;
+    
+    // Calculate progress: 0-80% for transcription (leave 10% for summarizing, 10% for final)
+    const progressPercent = Math.round((i / totalUsers) * 80);
+    if (onProgress) {
+      await onProgress(progressPercent, displayName);
+    }
+    
+    console.log(`\n👤 Processing ${displayName} (${i + 1}/${totalUsers})...`);
     const wavFile = path.join(transcriptsDir, `${userId}.wav`);
     
     try {
@@ -110,7 +120,7 @@ export async function transcribeSession(userFiles, sessionDir) {
       // Проверяем что WAV файл существует и не пустой
       const wavStats = await fs.stat(wavFile);
       if (wavStats.size === 0) {
-        console.warn(`⚠️  Skipping empty WAV for user ${userId}`);
+        console.warn(`⚠️  Skipping empty WAV for ${displayName}`);
         continue;
       }
 
@@ -119,17 +129,23 @@ export async function transcribeSession(userFiles, sessionDir) {
       if (text.trim()) {
         segments.push({
           userId,
+          userName: displayName,
           offsetMs: startOffset,
           text: text.trim(),
         });
-        console.log(`✅ User ${userId}: "${text.substring(0, 50)}..."`);
+        console.log(`✅ ${displayName}: "${text.substring(0, 50)}..."`);
       } else {
-        console.warn(`⚠️  No transcription for user ${userId}`);
+        console.warn(`⚠️  No transcription for ${displayName}`);
       }
     } catch (error) {
-      console.error(`❌ Error processing user ${userId}:`, error.message);
+      console.error(`❌ Error processing ${displayName}:`, error.message);
       // Продолжаем со следующим пользователем
     }
+  }
+
+  // Progress 80% - all transcriptions done
+  if (onProgress) {
+    await onProgress(80, '');
   }
 
   console.log(`\n📊 Total segments: ${segments.length}`);
@@ -137,7 +153,8 @@ export async function transcribeSession(userFiles, sessionDir) {
   // Сортировать по времени старта записи участника
   segments.sort((a, b) => a.offsetMs - b.offsetMs);
 
-  const transcript = segments.map((seg) => `[<@${seg.userId}>] ${seg.text}`).join('\n');
+  // Use display names in transcript
+  const transcript = segments.map((seg) => `[${seg.userName}] ${seg.text}`).join('\n');
   
   if (!transcript.trim()) {
     throw new Error('Нет транскрипции. Возможно аудио было слишком коротким или тихим.');

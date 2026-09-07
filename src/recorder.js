@@ -55,14 +55,26 @@ export async function startRecording(connection, voiceChannel, outputDir) {
   receiver.speaking.on('start', (userId) => {
     console.log(`🎤 User ${userId} started speaking`);
     
-    if (userStreams.has(userId)) {
+    // Проверяем есть ли активная запись для этого юзера
+    const existingStream = userStreams.get(userId);
+    if (existingStream && existingStream.isActive) {
       console.log(`⚠️  User ${userId} already recording, skipping`);
       return;
     }
 
+    // Создаём файл для записи (с флагом 'a' для append если файл уже есть)
     const pcmFile = path.join(sessionDir, `${userId}.pcm`);
-    const writeStream = createWriteStream(pcmFile);
-    userStreams.set(userId, { pcmFile, writeStream, start: Date.now(), bytesWritten: 0 });
+    const isNewFile = !existingStream;
+    const writeStream = createWriteStream(pcmFile, { flags: 'a' }); // append mode!
+    
+    const streamInfo = { 
+      pcmFile, 
+      writeStream, 
+      start: existingStream?.start || Date.now(), // сохраняем оригинальное время старта
+      bytesWritten: existingStream?.bytesWritten || 0,
+      isActive: true
+    };
+    userStreams.set(userId, streamInfo);
 
     // Subscribe to user's audio (returns Opus stream)
     const opusStream = receiver.subscribe(userId, {
@@ -72,7 +84,7 @@ export async function startRecording(connection, voiceChannel, outputDir) {
       },
     });
 
-    console.log(`✅ Subscribed to Opus stream for user ${userId}`);
+    console.log(`✅ Subscribed to Opus stream for user ${userId}${isNewFile ? ' (new file)' : ' (appending)'}`);
 
     // Decode Opus → PCM (16-bit signed little-endian, 48kHz, stereo)
     const opusDecoder = new prism.opus.Decoder({
@@ -84,21 +96,28 @@ export async function startRecording(connection, voiceChannel, outputDir) {
     // Pipe: Opus → PCM Decoder → File
     opusStream.pipe(opusDecoder).pipe(writeStream);
 
+    // Когда поток заканчивается - помечаем как неактивный, но НЕ удаляем
+    // чтобы при следующем speaking событии дописывать в тот же файл
     opusStream.on('end', () => {
       const stream = userStreams.get(userId);
-      console.log(`🛑 Opus stream ended for user ${userId}`);
-      // writeStream закроется автоматически через pipe
+      if (stream) {
+        stream.isActive = false;
+        console.log(`🛑 Opus stream ended for user ${userId}, ready to append on next speech`);
+      }
     });
 
     opusStream.on('error', (err) => {
-      console.error(`❌ Opus stream error for user ${userId}:`, err);
+      console.error(`❌ Opus stream error for user ${userId}:`, err.message);
+      const stream = userStreams.get(userId);
+      if (stream) stream.isActive = false;
     });
 
     opusDecoder.on('error', (err) => {
-      console.error(`❌ Opus decoder error for user ${userId}:`, err);
+      console.error(`❌ Opus decoder error for user ${userId}:`, err.message);
+      // Не останавливаем запись при единичных ошибках декодера
     });
 
-    console.log(`📼 Started recording user ${userId} to ${pcmFile}`);
+    console.log(`📼 ${isNewFile ? 'Started' : 'Resumed'} recording user ${userId} to ${pcmFile}`);
   });
 
   receiver.speaking.on('end', (userId) => {
@@ -120,10 +139,29 @@ export async function startRecording(connection, voiceChannel, outputDir) {
 export async function stopRecording(session) {
   const { connection, userStreams, sessionDir, startTime } = session;
 
+  console.log(`🛑 Stopping recording, ${userStreams.size} users recorded`);
+
+  // Сначала закрываем все writeStream'ы явно
+  const closePromises = [];
+  for (const [userId, info] of userStreams.entries()) {
+    if (info.writeStream && !info.writeStream.destroyed) {
+      closePromises.push(new Promise((resolve) => {
+        info.writeStream.end(() => {
+          console.log(`📁 Closed file for user ${userId}`);
+          resolve();
+        });
+      }));
+    }
+  }
+  
+  // Ждём закрытия всех файлов
+  await Promise.all(closePromises);
+  
+  // Потом отключаемся от голосового канала
   connection.destroy();
 
-  // Дождаться закрытия файлов
-  await sleep(1000);
+  // Даём системе время на flush
+  await sleep(500);
 
   const userFiles = [];
   for (const [userId, info] of userStreams.entries()) {
@@ -134,10 +172,10 @@ export async function stopRecording(session) {
     throw new Error('Нет записанных аудиопотоков.');
   }
 
-  console.log('Transcribing session...');
+  console.log(`📝 Transcribing ${userFiles.length} user(s)...`);
   const transcript = await transcribeSession(userFiles, sessionDir);
 
-  console.log('Summarizing...');
+  console.log('🤖 Summarizing...');
   const summary = await summarizeTranscript(transcript);
 
   return {

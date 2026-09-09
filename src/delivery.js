@@ -3,6 +3,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -31,6 +35,33 @@ function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * Convert WAV to MP3 using ffmpeg (reduces file size ~10x)
+ * Returns path to MP3 file
+ */
+async function convertWavToMp3(wavPath) {
+  const mp3Path = wavPath.replace(/\.wav$/, '.mp3');
+  
+  try {
+    await execFileAsync('ffmpeg', [
+      '-i', wavPath,
+      '-codec:a', 'libmp3lame',
+      '-b:a', '64k',  // 64kbps is enough for voice
+      '-y',           // overwrite
+      mp3Path
+    ]);
+    
+    const wavStats = await fs.stat(wavPath);
+    const mp3Stats = await fs.stat(mp3Path);
+    console.log(`🔄 Converted: ${path.basename(wavPath)} (${formatSize(wavStats.size)}) → ${path.basename(mp3Path)} (${formatSize(mp3Stats.size)})`);
+    
+    return mp3Path;
+  } catch (err) {
+    console.error(`❌ FFmpeg conversion error: ${err.message}`);
+    return null; // Return null, caller will fallback to WAV
+  }
 }
 
 /**
@@ -331,16 +362,24 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
     }
   }
 
-  // Send all WAV files from transcripts/ directory
-  console.log(`🎵 Telegram: найдено ${wavFiles.length} WAV файлов`);
+  // Send all WAV files from transcripts/ directory (convert to MP3 first)
+  console.log(`🎵 Telegram: найдено ${wavFiles.length} WAV файлов, конвертирую в MP3...`);
+  
+  let allFilesSent = true;
   
   for (const wavFile of wavFiles) {
     const wavPath = path.join(transcriptsDir, wavFile);
-    console.log(`🎵 Telegram: отправка ${wavFile}...`);
+    
+    // Convert WAV to MP3
+    const mp3Path = await convertWavToMp3(wavPath);
+    const fileToSend = mp3Path || wavPath; // Fallback to WAV if conversion failed
+    const fileName = path.basename(fileToSend);
+    
+    console.log(`🎵 Telegram: отправка ${fileName}...`);
     
     try {
       const form = new (await import('form-data')).default();
-      form.append('document', await fs.readFile(wavPath), { filename: wavFile });
+      form.append('document', await fs.readFile(fileToSend), { filename: fileName });
       form.append('chat_id', chatId);
 
       await axios.post(
@@ -350,20 +389,25 @@ async function sendToTelegram(summary, transcript, durationSec, transcriptPath, 
           headers: form.getHeaders(),
         },
       );
-      console.log(`✅ Telegram: ${wavFile} отправлен`);
+      console.log(`✅ Telegram: ${fileName} отправлен`);
     } catch (err) {
-      console.error(`❌ Telegram: ошибка при отправке ${wavFile}:`, err.message);
+      console.error(`❌ Telegram: ошибка при отправке ${fileName}:`, err.message);
+      allFilesSent = false;
     }
   }
 
-  console.log('✅ Telegram: все файлы отправлены');
-  
-  // Cleanup: delete session directory after successful delivery
-  try {
-    await fs.rm(sessionDir, { recursive: true, force: true });
-    console.log(`🗑️ Deleted session directory: ${sessionDir}`);
-  } catch (err) {
-    console.error(`❌ Failed to delete session directory: ${err.message}`);
+  if (allFilesSent) {
+    console.log('✅ Telegram: все файлы отправлены');
+    
+    // Cleanup: delete session directory only after ALL files sent successfully
+    try {
+      await fs.rm(sessionDir, { recursive: true, force: true });
+      console.log(`🗑️ Deleted session directory: ${sessionDir}`);
+    } catch (err) {
+      console.error(`❌ Failed to delete session directory: ${err.message}`);
+    }
+  } else {
+    console.log(`⚠️ Telegram: не все файлы отправлены, сессия сохранена: ${sessionDir}`);
   }
   
   // Reset state

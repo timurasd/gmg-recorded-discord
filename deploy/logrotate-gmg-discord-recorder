@@ -1,0 +1,14 @@
+# /etc/logrotate.d/gmg-discord-recorder
+# systemd appends to these files; copytruncate keeps the open handle valid.
+/var/log/gmg-discord-recorder.log
+/var/log/gmg-discord-recorder.error.log
+/var/log/gmg-discord-cleanup.log {
+    weekly
+    rotate 4
+    maxsize 20M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

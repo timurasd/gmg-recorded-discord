@@ -157,6 +157,14 @@ export class SessionManager {
   }
 
   /**
+   * Stop tracking a session in memory; its final state is written to disk by
+   * the pipeline (updateSessionFile).
+   */
+  release(sessionId) {
+    this.activeSessions.delete(sessionId);
+  }
+
+  /**
    * Save session state atomically
    */
   _saveSessionState(session) {
@@ -287,6 +295,47 @@ export class SessionManager {
     
     return cleaned;
   }
+}
+
+/**
+ * Merge `patch` into a session.json on disk -- for sessions that aren't
+ * active in this process (recovered after a restart, or finished earlier).
+ */
+export function updateSessionFile(sessionDir, patch) {
+  const statePath = path.join(sessionDir, 'session.json');
+  try {
+    const session = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf-8')) : {};
+    Object.assign(session, patch);
+    writeFileSync(statePath + '.tmp', JSON.stringify(session, null, 2));
+    renameSync(statePath + '.tmp', statePath);
+    return session;
+  } catch (err) {
+    console.error(`[SessionManager] Failed to update ${statePath}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Processed sessions still on disk (the daily cleanup deletes them after 7
+ * days), newest first -- for !recordings and !audio.
+ */
+export function listProcessedSessions(baseDir) {
+  const sessions = [];
+  try {
+    for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith('session_')) continue;
+      const dir = path.join(baseDir, entry.name);
+      try {
+        const session = JSON.parse(readFileSync(path.join(dir, 'session.json'), 'utf-8'));
+        if (session.state === SESSION_STATES.COMPLETED) sessions.push({ ...session, dir });
+      } catch {
+        // no or broken session.json -- not a processed session
+      }
+    }
+  } catch (err) {
+    console.error('[SessionManager] Error listing sessions:', err.message);
+  }
+  return sessions.sort((a, b) => b.startTime - a.startTime);
 }
 
 export { SESSION_STATES };

@@ -1,17 +1,18 @@
 /**
- * RecoveryService - Crash recovery and session restoration
- * 
- * Features:
- * - Detect incomplete sessions on startup
- * - Recover partial recordings
- * - Mark recovered chunks
- * - Notify about recovered data
+ * RecoveryService - sessions cut off by a crash or restart.
+ *
+ * On startup: every session still "recording"/"processing" on disk is either
+ * handed back for processing (it has audio -- the meeting gets a transcript
+ * marked as interrupted) or marked failed (no audio). Its state is saved, so
+ * it isn't found again on the next start (the old version never saved it and
+ * "recovered" the same 8 empty sessions on every restart).
  */
 
-import { existsSync, readdirSync, renameSync, statSync } from 'fs';
+import { existsSync, readdirSync, statSync } from 'fs';
+import { execSync } from 'child_process';
 import path from 'path';
-import { recoverIncompleteChunks } from '../recorder/chunk-writer.js';
-import { SessionManager, SESSION_STATES } from '../recorder/session-manager.js';
+import { listChunkFiles } from '../recorder/chunk-writer.js';
+import { updateSessionFile } from '../recorder/session-manager.js';
 
 export class RecoveryService {
   constructor(recordingsDir, sessionManager) {
@@ -20,88 +21,50 @@ export class RecoveryService {
   }
 
   /**
-   * Run recovery on startup
-   * Returns list of recovered sessions
+   * Returns sessions with audio, ready for processSession().
    */
-  async runRecovery() {
+  runRecovery() {
     console.log('[Recovery] Scanning for incomplete sessions...');
-    
-    const recovered = [];
-    const sessions = this.sessionManager.findRecoverableSessions();
-    
-    for (const session of sessions) {
-      console.log('[Recovery] Found incomplete session: ' + session.id);
-      
-      try {
-        // Recover any incomplete chunks
-        const chunks = await recoverIncompleteChunks(session.dir);
-        
-        // Update session state
-        session.state = SESSION_STATES.RECOVERED;
-        session.recoveredAt = Date.now();
-        session.recoveredChunks = chunks.length;
-        
-        recovered.push({
-          sessionId: session.id,
-          channelName: session.channelName,
-          durationMin: Math.round((session.endTime || session.emergencyShutdown || Date.now()) - session.startTime) / 60000,
-          participants: Object.values(session.participants).map(function(p) { return p.userName; }),
-          recoveredChunks: chunks.length,
-          status: chunks.length > 0 ? 'partial_data' : 'no_data'
-        });
-        
-        console.log('[Recovery] Recovered session ' + session.id + ' with ' + chunks.length + ' partial chunks');
-      } catch (err) {
-        console.error('[Recovery] Failed to recover session ' + session.id + ':', err.message);
+    const toProcess = [];
+
+    for (const session of this.sessionManager.findRecoverableSessions()) {
+      const chunksDir = path.join(session.dir, 'chunks');
+      const userIds = existsSync(chunksDir)
+        ? readdirSync(chunksDir).filter((id) => listChunkFiles(path.join(chunksDir, id)).length > 0
+          || readdirSync(path.join(chunksDir, id)).some((f) => f.endsWith('.recording')))
+        : [];
+
+      if (userIds.length === 0) {
+        updateSessionFile(session.dir, { state: 'failed', error: 'recording cut off before any audio' });
+        console.log(`[Recovery] ${session.id}: no audio, marked failed`);
+        continue;
       }
+
+      // Without a clean shutdown time, the last write to a chunk is when it stopped.
+      const lastWrite = Math.max(...userIds.flatMap((id) => readdirSync(path.join(chunksDir, id))
+        .map((f) => statSync(path.join(chunksDir, id, f)).mtimeMs)));
+      const endTime = session.endTime || session.emergencyShutdown || lastWrite;
+      toProcess.push({
+        sessionId: session.id,
+        sessionDir: session.dir,
+        startTime: session.startTime,
+        endTime: Math.max(endTime, session.startTime + 1000),
+        users: userIds.map((userId) => ({ userId, name: session.participants?.[userId]?.userName || `User_${userId}` })),
+        participants: Object.values(session.participants || {}).map((p) => p.userName),
+        interrupted: true,
+      });
+      console.log(`[Recovery] ${session.id}: ${userIds.length} speaker(s) with audio, will process`);
     }
-    
-    if (recovered.length === 0) {
-      console.log('[Recovery] No incomplete sessions found');
-    } else {
-      console.log('[Recovery] Recovered ' + recovered.length + ' session(s)');
-    }
-    
-    return recovered;
+
+    if (toProcess.length === 0) console.log('[Recovery] Nothing to recover');
+    return toProcess;
   }
 
-  /**
-   * Get recovery summary for notification
-   */
-  formatRecoverySummary(recovered) {
-    if (recovered.length === 0) {
-      return null;
-    }
-    
-    const lines = ['[Recovery Report]', ''];
-    
-    for (const r of recovered) {
-      lines.push('Session: ' + r.channelName);
-      lines.push('  Duration: ~' + r.durationMin + ' min');
-      lines.push('  Participants: ' + r.participants.join(', '));
-      lines.push('  Status: ' + r.status);
-      lines.push('');
-    }
-    
-    return lines.join('\n');
-  }
-
-  /**
-   * Check disk space
-   */
   checkDiskSpace() {
     try {
-      const { execSync } = require('child_process');
-      const output = execSync('df -h ' + this.recordingsDir + ' | tail -1').toString();
-      const parts = output.trim().split(/\s+/);
-      
-      return {
-        total: parts[1],
-        used: parts[2],
-        available: parts[3],
-        usePercent: parseInt(parts[4])
-      };
-    } catch (err) {
+      const parts = execSync(`df -h "${this.recordingsDir}" | tail -1`).toString().trim().split(/\s+/);
+      return { total: parts[1], used: parts[2], available: parts[3], usePercent: parseInt(parts[4]) };
+    } catch {
       return null;
     }
   }

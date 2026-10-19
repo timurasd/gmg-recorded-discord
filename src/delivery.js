@@ -1,422 +1,204 @@
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import FormData from 'form-data';
 
-const execFileAsync = promisify(execFile);
+const TG_TEXT_LIMIT = 4000; // Telegram allows 4096; leave room for HTML entities
+const DISCORD_TEXT_LIMIT = 1900;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const projectRoot = path.resolve(__dirname, '..');
-
-// Store message IDs for editing
-let progressMessageId = null;
-let currentSessionInfo = null;
-
-/**
- * Escape HTML special characters
- */
-function escapeHtml(text) {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+export function escapeHtml(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-
-
-/**
- * Format file size
- */
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+export function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h} ч ${m} мин`;
+  if (m > 0) return `${m} мин ${s} сек`;
+  return `${s} сек`;
 }
 
-/**
- * Convert WAV to MP3 using ffmpeg (reduces file size ~10x)
- * Returns path to MP3 file
- */
-async function convertWavToMp3(wavPath) {
-  const mp3Path = wavPath.replace(/\.wav$/, '.mp3');
-  
-  try {
-    await execFileAsync('ffmpeg', [
-      '-i', wavPath,
-      '-codec:a', 'libmp3lame',
-      '-b:a', '64k',  // 64kbps is enough for voice
-      '-y',           // overwrite
-      mp3Path
-    ]);
-    
-    const wavStats = await fs.stat(wavPath);
-    const mp3Stats = await fs.stat(mp3Path);
-    console.log(`🔄 Converted: ${path.basename(wavPath)} (${formatSize(wavStats.size)}) → ${path.basename(mp3Path)} (${formatSize(mp3Stats.size)})`);
-    
-    return mp3Path;
-  } catch (err) {
-    console.error(`❌ FFmpeg conversion error: ${err.message}`);
-    return null; // Return null, caller will fallback to WAV
-  }
+export function formatMoscowTime(ms) {
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).format(new Date(ms)) + ' МСК';
 }
 
-/**
- * Estimate transcription time based on audio size
- * Rough estimate: 1 MB WAV ≈ 1 minute audio ≈ 30 sec transcription (small model on CPU)
- */
-function estimateTranscriptionTime(totalWavBytes) {
-  const minutes = totalWavBytes / (1024 * 1024); // approx minutes of audio
-  const transcriptionMinutes = minutes * 0.5; // rough estimate
-  return Math.ceil(Math.max(1, transcriptionMinutes));
-}
-
-/**
- * Build progress bar
- */
 function buildProgressBar(percent) {
   const filled = Math.floor(percent / 5);
-  const empty = 20 - filled;
-  return '[' + '█'.repeat(filled) + '░'.repeat(empty) + '] ' + percent + '%';
+  return '[' + '█'.repeat(filled) + '░'.repeat(20 - filled) + '] ' + percent + '%';
 }
 
-/**
- * Notify Telegram and Discord that recording has started
- */
-export async function notifyRecordingStart(voiceChannel, participants = []) {
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  
-  const channelName = escapeHtml(voiceChannel.name);
-  const participantNames = participants.map(p => escapeHtml(p)).join(', ') || 'ожидание...';
-  
-  const message = `🔴 <b>Запись началась</b>\n\n📢 Канал: ${channelName}\n👥 Участники: ${participantNames}`;
-  
-  if (chatId && token) {
-    try {
-      await axios.post(
-        `https://api.telegram.org/bot${token}/sendMessage`,
-        {
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'HTML',
-        },
-      );
-      console.log('✅ Telegram: уведомление о начале записи отправлено');
-    } catch (err) {
-      console.error('❌ Telegram: ошибка при отправке уведомления о начале:', err.message);
-    }
+/** Split text into pieces of at most `limit` chars, on line breaks when possible. */
+export function splitText(text, limit) {
+  const parts = [];
+  let rest = String(text);
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit / 2) cut = limit;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, '');
   }
+  if (rest) parts.push(rest);
+  return parts;
 }
 
-/**
- * Notify Telegram that recording has ended and processing started
- */
-export async function notifyRecordingEnd(sessionInfo) {
+// ---------- Telegram ----------
+
+function tgConfig() {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!chatId || !token) return null;
+  return chatId && token ? { chatId, token } : null;
+}
 
-  const { durationMin, speakerCount, totalSize, estimatedMin } = sessionInfo;
-  
-  const message = [
-    `⏹️ <b>Запись закончена</b>`,
-    ``,
-    `⏱ Длительность: <b>${durationMin} мин</b>`,
-    `🎤 Спикеров: <b>${speakerCount}</b>`,
-    `💾 Размер: <b>${formatSize(totalSize)}</b>`,
-    ``,
-    `⏳ Приступаю к транскрипции и суммаризации`,
-    `📊 Ориентировочно: <b>~${estimatedMin} мин</b>`,
-  ].join('\n');
-  
+async function tgCall(method, payload) {
+  const cfg = tgConfig();
+  if (!cfg) return null;
+  const res = await axios.post(`https://api.telegram.org/bot${cfg.token}/${method}`, { chat_id: cfg.chatId, ...payload });
+  return res.data?.result ?? null;
+}
+
+async function tgUpload(method, field, filePath, filename, extra = {}) {
+  const cfg = tgConfig();
+  if (!cfg) return null;
+  const form = new FormData();
+  form.append('chat_id', cfg.chatId);
+  for (const [k, v] of Object.entries(extra)) form.append(k, v);
+  form.append(field, await fs.readFile(filePath), { filename });
+  const res = await axios.post(`https://api.telegram.org/bot${cfg.token}/${method}`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return res.data?.result ?? null;
+}
+
+/** Plain HTML message to the Telegram chat; errors are logged, not thrown. */
+export async function sendTelegramText(html) {
   try {
-    const response = await axios.post(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      {
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'HTML',
-      },
-    );
-    console.log('✅ Telegram: уведомление об окончании записи отправлено');
-    progressMessageId = response.data?.result?.message_id;
-    currentSessionInfo = sessionInfo;
-    return progressMessageId;
+    return await tgCall('sendMessage', { text: html, parse_mode: 'HTML', disable_web_page_preview: true });
   } catch (err) {
-    console.error('❌ Telegram: ошибка при отправке уведомления об окончании:', err.message);
+    console.error('❌ Telegram: sendMessage failed:', err.response?.data?.description || err.message);
     return null;
   }
 }
 
-/**
- * Update progress message in Telegram
- */
-export async function updateProgress(percent, currentUser = '', status = 'transcribing') {
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!chatId || !token || !progressMessageId) return;
+export async function notifyRecordingStart(channelName, participants = []) {
+  const names = participants.map(escapeHtml).join(', ') || 'пока никого';
+  await sendTelegramText(`🔴 <b>Запись началась</b>\n\n📢 Канал: ${escapeHtml(channelName)}\n👥 В канале: ${names}`);
+}
 
-  const progressBar = buildProgressBar(percent);
-  const statusText = status === 'transcribing' 
-    ? `🎤 Транскрибирую: ${currentUser}`
-    : status === 'summarizing'
-    ? `🤖 Генерирую саммари...`
-    : `✅ Готово!`;
-  
-  // Build session info line
-  const sessionLine = currentSessionInfo 
-    ? `Запись: ${currentSessionInfo.durationMin} мин, ${currentSessionInfo.speakerCount} спикер(ов). Займёт ~${currentSessionInfo.estimatedMin} мин.`
-    : '';
-  
-  const message = [
-    `⏳ <b>Обработка записи</b>`,
-    sessionLine,
+/** Returns the id of the message that then shows processing progress. */
+export async function notifyRecordingEnd({ durationMin, speakerCount }) {
+  const msg = await sendTelegramText([
+    `⏹️ <b>Запись закончена</b>`,
     ``,
-    `<code>${progressBar}</code>`,
+    `⏱ Длительность: <b>${durationMin} мин</b>`,
+    `🎤 Говорили: <b>${speakerCount}</b>`,
     ``,
-    statusText,
-  ].join('\n');
-  
+    `⏳ Расшифровываю. Час разговора — примерно 20–40 минут обработки.`,
+  ].join('\n'));
+  return msg?.message_id ?? null;
+}
+
+export async function updateProgress(messageId, percent, label) {
+  if (!messageId) return;
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${token}/editMessageText`,
-      {
-        chat_id: chatId,
-        message_id: progressMessageId,
-        text: message,
-        parse_mode: 'HTML',
-      },
-    );
+    await tgCall('editMessageText', {
+      message_id: messageId,
+      parse_mode: 'HTML',
+      text: [`⏳ <b>Обработка записи</b>`, ``, `<code>${buildProgressBar(percent)}</code>`, ``, escapeHtml(label)].join('\n'),
+    });
   } catch (err) {
-    // Ignore "message is not modified" errors
-    if (!err.message?.includes('message is not modified')) {
-      console.error('❌ Telegram: ошибка обновления прогресса:', err.message);
+    const desc = err.response?.data?.description || err.message;
+    if (!String(desc).includes('message is not modified')) console.error('❌ Telegram: progress update failed:', desc);
+  }
+}
+
+/**
+ * Deliver a processed meeting: summary as text, transcript as a file.
+ * The transcript goes out even when the summary failed.
+ */
+export async function sendResults({ transcriptPath, summary, summaryError, participants = [], durationSec, startTime, interrupted, progressMessageId }) {
+  const when = formatMoscowTime(startTime);
+  const who = participants.join(', ') || 'неизвестно';
+  // Moscow wall clock in the file name: transcript_2026-10-19_14-03.txt
+  const fileName = `transcript_${new Date(startTime + 3 * 3600_000).toISOString().slice(0, 16).replace('T', '_').replace(':', '-')}.txt`;
+  const warn = interrupted
+    ? '⚠️ Запись прервалась (обрыв связи или перезапуск бота) — обработано то, что успело записаться.'
+    : '';
+
+  // Telegram
+  if (tgConfig()) {
+    const header = [`✅ <b>Созвон ${escapeHtml(when)}</b>`, `👥 ${escapeHtml(who)}`, `⏱ ${formatDuration(durationSec)}`, warn && `\n${warn}`]
+      .filter(Boolean).join('\n');
+    const body = summary
+      ? escapeHtml(summary)
+      : `⚠️ Сводку сделать не получилось: ${escapeHtml(summaryError || 'неизвестная ошибка')}. Расшифровка — в файле ниже.`;
+    const footer = '🎧 Сама запись разговора — командой <code>!audio</code> в Discord.';
+    const parts = splitText(`${header}\n\n${body}\n\n${footer}`, TG_TEXT_LIMIT);
+    for (const part of parts) await sendTelegramText(part);
+    try {
+      await tgUpload('sendDocument', 'document', transcriptPath, fileName, { caption: `Расшифровка, ${when}` });
+      console.log('✅ Telegram: transcript sent');
+    } catch (err) {
+      console.error('❌ Telegram: transcript upload failed:', err.response?.data?.description || err.message);
+    }
+    if (progressMessageId) {
+      try {
+        await tgCall('editMessageText', { message_id: progressMessageId, text: '✅ Обработка закончена, результат ниже.' });
+      } catch { /* not important */ }
+    }
+  } else {
+    console.log('⚠️ Telegram: no TELEGRAM_CHAT_ID / TELEGRAM_BOT_TOKEN, skipping');
+  }
+
+  // Discord summary channel
+  const channelId = process.env.DISCORD_SUMMARY_CHANNEL_ID;
+  if (channelId) {
+    try {
+      const head = [`**Созвон ${when}**`, `👥 ${who}`, `⏱ ${formatDuration(durationSec)}`, warn].filter(Boolean).join('\n');
+      const text = summary || `⚠️ Сводку сделать не получилось: ${summaryError || 'неизвестная ошибка'}.`;
+      const full = `${head}\n\n${text}`;
+      await sendDiscordMessage(channelId, full.length <= DISCORD_TEXT_LIMIT ? full : `${head}\n\nСводка и расшифровка — в файлах.`);
+      if (summary && full.length > DISCORD_TEXT_LIMIT) {
+        const summaryPath = path.join(path.dirname(transcriptPath), 'summary.txt');
+        await sendDiscordFile(channelId, summaryPath, 'summary.txt');
+      }
+      await sendDiscordFile(channelId, transcriptPath, fileName);
+    } catch (err) {
+      console.error('❌ Discord: summary delivery failed:', err.response?.data?.message || err.message);
     }
   }
 }
 
-/**
- * Отправить сводку и полную расшифровку в Discord и Telegram.
- */
-export async function sendResults(result) {
-  const { summary, transcript, sessionDir, durationSec, participants = [] } = result;
-
-  const transcriptPath = path.join(sessionDir, 'transcript.txt');
-  const summaryPath = path.join(sessionDir, 'summary.txt');
-
-  await fs.writeFile(transcriptPath, transcript, 'utf-8');
-  await fs.writeFile(summaryPath, summary, 'utf-8');
-
-  await sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, participants);
-  await sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, participants);
-}
-
-async function sendToDiscord(summary, transcript, durationSec, transcriptPath, summaryPath, participants) {
-  const channelId = process.env.DISCORD_SUMMARY_CHANNEL_ID;
-  if (!channelId) return;
-
-  const participantList = participants.length > 0 ? participants.join(', ') : 'N/A';
-  
-  // Extract one-line discussion summary from Claude's summary (first paragraph usually)
-  const discussionLine = extractDiscussionLine(summary);
-
-  // Discord limit: 2000 chars. If summary is too long, just send a short message
-  const MAX_LENGTH = 1600;
-  
-  const header = [
-    `**Сводка созвона**`,
-    `👥 Участники: ${participantList}`,
-    `⏱ Длительность: ${formatDuration(durationSec)}`,
-    `💬 Обсуждение: ${discussionLine}`,
-    ``,
-    `📎 Файлы прикреплены ниже`,
-  ].join('\n');
-
-  let discordMessage;
-  if (summary.length > MAX_LENGTH) {
-    discordMessage = header;
-  } else {
-    discordMessage = header + '\n\n---\n\n' + summary;
+/** Send the meeting audio (one or more mp3 parts) to the Telegram chat. */
+export async function sendAudioFiles(files, caption) {
+  for (let i = 0; i < files.length; i++) {
+    const name = path.basename(files[i]);
+    const partCaption = files.length > 1 ? `${caption} (часть ${i + 1} из ${files.length})` : caption;
+    await tgUpload('sendAudio', 'audio', files[i], name, { caption: partCaption, title: partCaption });
+    console.log(`✅ Telegram: audio ${name} sent`);
   }
-
-  await sendDiscordMessage(channelId, discordMessage);
-
-  // Отправить файлы
-  await sendDiscordFile(channelId, summaryPath, 'summary.txt');
-  await sendDiscordFile(channelId, transcriptPath, 'transcript.txt');
 }
 
-/**
- * Extract a one-line discussion summary from full summary
- */
-function extractDiscussionLine(summary) {
-  // Try to get first meaningful sentence
-  const lines = summary.split('\n').filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('-'));
-  const firstLine = lines[0] || summary.substring(0, 200);
-  // Truncate to ~150 chars
-  if (firstLine.length > 150) {
-    return firstLine.substring(0, 147) + '...';
-  }
-  return firstLine;
-}
+// ---------- Discord REST ----------
 
 async function sendDiscordMessage(channelId, content) {
-  const token = process.env.DISCORD_TOKEN;
   await axios.post(
     `https://discord.com/api/v10/channels/${channelId}/messages`,
     { content },
-    {
-      headers: {
-        Authorization: `Bot ${token}`,
-        'Content-Type': 'application/json',
-      },
-    },
+    { headers: { Authorization: `Bot ${process.env.DISCORD_TOKEN}`, 'Content-Type': 'application/json' } },
   );
 }
 
 async function sendDiscordFile(channelId, filePath, filename) {
-  const token = process.env.DISCORD_TOKEN;
-  const form = new (await import('form-data')).default();
+  const form = new FormData();
   form.append('file', await fs.readFile(filePath), { filename });
-
   await axios.post(
     `https://discord.com/api/v10/channels/${channelId}/messages`,
     form,
-    {
-      headers: {
-        Authorization: `Bot ${token}`,
-        ...form.getHeaders(),
-      },
-    },
+    { headers: { Authorization: `Bot ${process.env.DISCORD_TOKEN}`, ...form.getHeaders() } },
   );
-}
-
-async function sendToTelegram(summary, transcript, durationSec, transcriptPath, summaryPath, sessionDir, participants) {
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!chatId || !token) {
-    console.log('⚠️ Telegram: нет TELEGRAM_CHAT_ID или TELEGRAM_BOT_TOKEN, пропускаю');
-    return;
-  }
-
-  console.log('📤 Telegram: отправка результатов...');
-
-  const participantList = participants.length > 0 ? participants.map(p => escapeHtml(p)).join(', ') : 'N/A';
-  const discussionLine = escapeHtml(extractDiscussionLine(summary));
-
-  // Count WAV files
-  const transcriptsDir = path.join(sessionDir, 'transcripts');
-  let wavFiles = [];
-  try {
-    const files = await fs.readdir(transcriptsDir);
-    wavFiles = files.filter(f => f.endsWith('.wav'));
-  } catch {}
-
-  // Send final summary message
-  const finalMessage = [
-    `✅ <b>Сводка созвона</b>`,
-    ``,
-    `👥 Участники: ${participantList}`,
-    `⏱ Длительность: ${formatDuration(durationSec)}`,
-    `💬 Обсуждение: ${discussionLine}`,
-    ``,
-    `📎 Прикрепляю файлы ниже:`,
-  ].join('\n');
-
-  try {
-    await axios.post(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      {
-        chat_id: chatId,
-        text: finalMessage,
-        parse_mode: 'HTML',
-      },
-    );
-  } catch (err) {
-    console.error('❌ Telegram: ошибка при отправке финального сообщения:', err.message);
-  }
-
-  // Send summary and transcript files
-  for (const file of [summaryPath, transcriptPath]) {
-    const filename = path.basename(file);
-    console.log(`📄 Telegram: отправка ${filename}...`);
-    try {
-      const form = new (await import('form-data')).default();
-      form.append('document', await fs.readFile(file), { filename });
-      form.append('chat_id', chatId);
-
-      await axios.post(
-        `https://api.telegram.org/bot${token}/sendDocument`,
-        form,
-        {
-          headers: form.getHeaders(),
-        },
-      );
-      console.log(`✅ Telegram: ${filename} отправлен`);
-    } catch (err) {
-      console.error(`❌ Telegram: ошибка при отправке ${filename}:`, err.message);
-    }
-  }
-
-  // Send all WAV files from transcripts/ directory (convert to MP3 first)
-  console.log(`🎵 Telegram: найдено ${wavFiles.length} WAV файлов, конвертирую в MP3...`);
-  
-  let allFilesSent = true;
-  
-  for (const wavFile of wavFiles) {
-    const wavPath = path.join(transcriptsDir, wavFile);
-    
-    // Convert WAV to MP3
-    const mp3Path = await convertWavToMp3(wavPath);
-    const fileToSend = mp3Path || wavPath; // Fallback to WAV if conversion failed
-    const fileName = path.basename(fileToSend);
-    
-    console.log(`🎵 Telegram: отправка ${fileName}...`);
-    
-    try {
-      const form = new (await import('form-data')).default();
-      form.append('document', await fs.readFile(fileToSend), { filename: fileName });
-      form.append('chat_id', chatId);
-
-      await axios.post(
-        `https://api.telegram.org/bot${token}/sendDocument`,
-        form,
-        {
-          headers: form.getHeaders(),
-        },
-      );
-      console.log(`✅ Telegram: ${fileName} отправлен`);
-    } catch (err) {
-      console.error(`❌ Telegram: ошибка при отправке ${fileName}:`, err.message);
-      allFilesSent = false;
-    }
-  }
-
-  if (allFilesSent) {
-    console.log('✅ Telegram: все файлы отправлены');
-    
-    // Cleanup: delete session directory only after ALL files sent successfully
-    try {
-      await fs.rm(sessionDir, { recursive: true, force: true });
-      console.log(`🗑️ Deleted session directory: ${sessionDir}`);
-    } catch (err) {
-      console.error(`❌ Failed to delete session directory: ${err.message}`);
-    }
-  } else {
-    console.log(`⚠️ Telegram: не все файлы отправлены, сессия сохранена: ${sessionDir}`);
-  }
-  
-  // Reset state
-  progressMessageId = null;
-  currentSessionInfo = null;
-}
-
-function formatDuration(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}м ${s.toString().padStart(2, '0')}с`;
 }

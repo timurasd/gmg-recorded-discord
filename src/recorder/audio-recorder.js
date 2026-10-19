@@ -1,23 +1,22 @@
 /**
- * AudioRecorder - Orchestrates reliable audio recording
- * 
- * Main features:
- * - Chunked recording with atomic writes
- * - Per-user audio streams
- * - Automatic chunk rotation
- * - Crash recovery support
- * - Progress tracking
+ * AudioRecorder - records a voice channel from !join to !leave.
+ *
+ * - One crash-safe chunk stream per user (ChunkWriter)
+ * - A marker at the start of every utterance, so the processing step knows
+ *   when each piece was said (see timeline.js)
+ * - Any number of people; someone who joins later is picked up when they talk
+ *
+ * Processing (transcript, summary, delivery) lives in pipeline.js, so the same
+ * code also handles a session recovered after a crash.
  */
 
 import { VoiceConnectionStatus, entersState, EndBehaviorType } from '@discordjs/voice';
 import prism from 'prism-media';
+import path from 'path';
 import { ChunkWriter } from './chunk-writer.js';
-import { SessionManager, SESSION_STATES } from './session-manager.js';
-import { transcribeSession } from '../transcribe.js';
-import { summarizeTranscript } from '../summarize.js';
-import { updateProgress, notifyRecordingEnd } from '../delivery.js';
 
-const HEALTH_CHECK_INTERVAL = 10000; // 10 sec
+const HEALTH_CHECK_INTERVAL = 10000; // sync chunks to disk every 10 sec
+const HEALTH_LOG_INTERVAL = 60000;
 const INACTIVITY_WARNING_MS = 300000; // 5 min without audio
 
 export class AudioRecorder {
@@ -32,7 +31,9 @@ export class AudioRecorder {
     this.startTime = null;
     this.lastAudioTime = null;
     this.healthCheckInterval = null;
+    this.lastHealthLog = 0;
     this.isRecording = false;
+    this.disconnected = false;
     this.userNames = new Map();
   }
 
@@ -46,55 +47,37 @@ export class AudioRecorder {
     this.lastAudioTime = Date.now();
     this.isRecording = true;
 
-    // Create session
-    this.session = this.sessionManager.createSession(
-      voiceChannel.id,
-      voiceChannel.name,
-      voiceChannel.guild.id
-    );
+    this.session = this.sessionManager.createSession(voiceChannel.id, voiceChannel.name, voiceChannel.guild.id);
 
-    // Collect initial participants
     voiceChannel.members.forEach(member => {
-      if (!member.user.bot) {
-        this.userNames.set(member.id, member.displayName || member.user.username);
-        this.sessionManager.addParticipant(this.session.id, member.id, member.displayName);
-      }
+      if (!member.user.bot) this.userNames.set(member.id, member.displayName || member.user.username);
     });
 
-    // Setup connection handlers
     this._setupConnectionHandlers();
 
-    // Wait for connection to be ready
     console.log('[AudioRecorder] Waiting for connection...');
-    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+    await entersState(connection, VoiceConnectionStatus.Ready, 30000);
     console.log('[AudioRecorder] Connection ready!');
 
-    // Setup audio receiver
     this.receiver = connection.receiver;
     this._setupSpeakingHandlers();
-
-    // Start health monitoring
     this._startHealthCheck();
 
     console.log(`[AudioRecorder] Started recording session ${this.session.id}`);
     return this.session;
   }
 
-  /**
-   * Setup connection state handlers
-   */
   _setupConnectionHandlers() {
     this.connection.on('stateChange', (oldState, newState) => {
       console.log(`[AudioRecorder] Connection: ${oldState.status} -> ${newState.status}`);
-      
       if (newState.status === VoiceConnectionStatus.Disconnected) {
-        // Try to reconnect
         Promise.race([
           entersState(this.connection, VoiceConnectionStatus.Signalling, 5000),
           entersState(this.connection, VoiceConnectionStatus.Connecting, 5000),
         ]).catch(() => {
-          // Truly disconnected - save what we have
-          console.log('[AudioRecorder] Connection lost, emergency saving...');
+          // Truly disconnected: keep what we have; !leave still processes it.
+          console.log('[AudioRecorder] Connection lost, saving what was recorded');
+          this.disconnected = true;
           this._emergencySave();
         });
       }
@@ -105,239 +88,146 @@ export class AudioRecorder {
     });
   }
 
-  /**
-   * Setup audio speaking event handlers
-   */
+  /** Display name, also for someone who joined the channel after !join. */
+  _nameFor(userId) {
+    let name = this.userNames.get(userId);
+    if (!name) {
+      const member = this.voiceChannel?.guild.members.cache.get(userId);
+      name = member?.displayName || member?.user?.username || `User_${userId}`;
+      this.userNames.set(userId, name);
+    }
+    return name;
+  }
+
   _setupSpeakingHandlers() {
     this.receiver.speaking.on('start', (userId) => {
       this.lastAudioTime = Date.now();
-      
-      // Get or create chunk writer for this user
+      if (!this.isRecording) return;
+
+      // One subscription per utterance. While the previous one hasn't ended
+      // (a pause under 1 s), subscribe() hands back the SAME stream -- the old
+      // code piped it into a second decoder and wrote every frame twice.
+      if (this.receiver.subscriptions.has(userId)) return;
+
       let writer = this.chunkWriters.get(userId);
       if (!writer) {
         writer = new ChunkWriter(this.session.dir, userId);
         this.chunkWriters.set(userId, writer);
       }
-
-      // Update session with participant
-      const userName = this.userNames.get(userId) || `User_${userId}`;
+      const userName = this._nameFor(userId);
       this.sessionManager.addParticipant(this.session.id, userId, userName);
 
-      // Subscribe to user's audio
       const opusStream = this.receiver.subscribe(userId, {
-        end: {
-          behavior: EndBehaviorType.AfterSilence,
-          duration: 1000,
-        },
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
       });
+      const opusDecoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
 
-      // Decode Opus -> PCM
-      const opusDecoder = new prism.opus.Decoder({
-        frameSize: 960,
-        channels: 2,
-        rate: 48000,
-      });
-
-      // Write decoded audio to chunks
+      let marked = false;
       opusDecoder.on('data', (chunk) => {
-        if (this.isRecording) {
-          writer.write(chunk);
+        if (!this.isRecording) return;
+        if (!marked) {
+          // When this utterance starts in the meeting, at the first sound.
+          writer.mark(Date.now() - this.startTime);
+          marked = true;
         }
+        writer.write(chunk);
       });
 
       opusStream.on('error', (err) => {
         console.error(`[AudioRecorder] Stream error for ${userId}:`, err.message);
       });
-
       opusDecoder.on('error', (err) => {
         console.error(`[AudioRecorder] Decoder error for ${userId}:`, err.message);
       });
 
       opusStream.pipe(opusDecoder);
-      
-      console.log(`[AudioRecorder] 🎤 User ${userName} started speaking`);
     });
 
     this.receiver.speaking.on('end', (userId) => {
-      const userName = this.userNames.get(userId) || userId;
-      console.log(`[AudioRecorder] 🔇 User ${userName} stopped speaking`);
-      
-      // Sync current chunk to disk
-      const writer = this.chunkWriters.get(userId);
-      if (writer) {
-        writer.sync();
-      }
+      this.chunkWriters.get(userId)?.sync();
     });
   }
 
-  /**
-   * Start health monitoring
-   */
   _startHealthCheck() {
     this.healthCheckInterval = setInterval(() => {
-      const stats = this.getStats();
-      const timeSinceLastAudio = Date.now() - this.lastAudioTime;
-      
-      // Log stats
-      console.log(`[AudioRecorder] Health: ${stats.durationMin}min, ${stats.speakerCount} speakers, ${(stats.totalBytes / 1024 / 1024).toFixed(2)}MB`);
-      
-      // Warning if no audio for a while
-      if (timeSinceLastAudio > INACTIVITY_WARNING_MS) {
-        console.warn(`[AudioRecorder] ⚠️ No audio for ${Math.round(timeSinceLastAudio / 60000)} minutes`);
-      }
+      for (const writer of this.chunkWriters.values()) writer.sync();
 
-      // Sync all writers
-      for (const writer of this.chunkWriters.values()) {
-        writer.sync();
+      const now = Date.now();
+      if (now - this.lastHealthLog >= HEALTH_LOG_INTERVAL) {
+        this.lastHealthLog = now;
+        const stats = this.getStats();
+        console.log(`[AudioRecorder] Health: ${stats.durationMin}min, ${stats.speakerCount} speakers, ${(stats.totalBytes / 1024 / 1024).toFixed(2)}MB`);
+        if (now - this.lastAudioTime > INACTIVITY_WARNING_MS) {
+          console.warn(`[AudioRecorder] No audio for ${Math.round((now - this.lastAudioTime) / 60000)} minutes`);
+        }
       }
     }, HEALTH_CHECK_INTERVAL);
   }
 
-  /**
-   * Get current recording stats
-   */
   getStats() {
     let totalBytes = 0;
-    let chunksCount = 0;
-
-    for (const writer of this.chunkWriters.values()) {
-      const stats = writer.getStats();
-      totalBytes += stats.totalBytes;
-      chunksCount += stats.chunksCompleted;
-    }
-
+    for (const writer of this.chunkWriters.values()) totalBytes += writer.getStats().totalBytes;
     return {
       sessionId: this.session?.id,
       durationMin: Math.round((Date.now() - this.startTime) / 60000),
       speakerCount: this.chunkWriters.size,
       totalBytes,
-      chunksCount,
       isRecording: this.isRecording,
-      participants: Array.from(this.userNames.values())
+      participants: Array.from(this.userNames.values()),
     };
   }
 
   /**
-   * Stop recording and process
+   * Stop recording. Returns what the pipeline needs to process the session.
    */
   async stop() {
-    if (!this.isRecording) {
-      throw new Error('Not recording');
-    }
+    if (!this.isRecording) throw new Error('Not recording');
 
     console.log('[AudioRecorder] Stopping recording...');
     this.isRecording = false;
+    if (this.healthCheckInterval) clearInterval(this.healthCheckInterval);
 
-    // Stop health check
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
+    for (const writer of this.chunkWriters.values()) writer.close();
+    try {
+      this.connection.destroy();
+    } catch (err) {
+      console.error('[AudioRecorder] Destroy error:', err.message);
     }
-
-    // Close all chunk writers
-    const userFiles = [];
-    for (const [userId, writer] of this.chunkWriters.entries()) {
-      writer.close();
-      
-      // Concatenate chunks into single PCM
-      const pcmPath = `${this.session.dir}/${userId}.pcm`;
-      try {
-        await writer.concatenateChunks(pcmPath);
-        userFiles.push({
-          userId,
-          userName: this.userNames.get(userId) || `User_${userId}`,
-          pcmFile: pcmPath,
-          startOffset: 0
-        });
-      } catch (err) {
-        console.error(`[AudioRecorder] Failed to concatenate chunks for ${userId}:`, err.message);
-      }
-    }
-
-    // Disconnect from voice
-    this.connection.destroy();
-
-    // Update session state
     this.sessionManager.endSession(this.session.id);
 
-    if (userFiles.length === 0) {
-      this.sessionManager.failSession(this.session.id, new Error('No audio recorded'));
-      throw new Error('Нет записанных аудиопотоков.');
-    }
-
+    const endTime = Date.now();
+    const users = Array.from(this.chunkWriters.keys()).map(userId => ({
+      userId,
+      name: this._nameFor(userId),
+      chunksDir: path.join(this.session.dir, 'chunks', userId),
+    }));
     const stats = this.getStats();
-    console.log(`[AudioRecorder] Recording stopped: ${stats.durationMin}min, ${stats.speakerCount} speakers, ${(stats.totalBytes / 1024 / 1024).toFixed(2)}MB`);
+    console.log(`[AudioRecorder] Recording stopped: ${stats.durationMin}min, ${users.length} speakers, ${(stats.totalBytes / 1024 / 1024).toFixed(2)}MB`);
 
     return {
-      session: this.session,
-      userFiles,
-      stats
+      sessionId: this.session.id,
+      sessionDir: this.session.dir,
+      startTime: this.startTime,
+      endTime,
+      users,
+      participants: Array.from(this.userNames.values()),
+      interrupted: this.disconnected,
     };
   }
 
-  /**
-   * Process recording (transcribe + summarize)
-   */
-  async process(userFiles) {
-    try {
-      // Update progress: starting transcription
-      await updateProgress(0, '', 'transcribing');
-
-      console.log('[AudioRecorder] Starting transcription...');
-      const transcript = await transcribeSession(userFiles, this.session.dir, async (progress, userName) => {
-        await updateProgress(progress, userName, 'transcribing');
-      });
-
-      // Update progress: summarizing
-      await updateProgress(90, '', 'summarizing');
-
-      console.log('[AudioRecorder] Starting summarization...');
-      const summary = await summarizeTranscript(transcript);
-
-      // Update progress: done
-      await updateProgress(100, '', 'done');
-
-      // Mark session as complete
-      this.sessionManager.completeSession(this.session.id, { transcript, summary });
-
-      return {
-        sessionDir: this.session.dir,
-        transcript,
-        summary,
-        participants: Array.from(this.userNames.values()),
-        durationSec: Math.round((Date.now() - this.startTime) / 1000),
-      };
-    } catch (err) {
-      this.sessionManager.failSession(this.session.id, err);
-      throw err;
-    }
-  }
-
-  /**
-   * Emergency save all data (called on crash)
-   */
   _emergencySave() {
     console.log('[AudioRecorder] Emergency saving all chunks...');
-    
-    for (const writer of this.chunkWriters.values()) {
-      writer.emergencySave();
-    }
-    
-    if (this.session) {
-      this.sessionManager.emergencySaveAll();
-    }
+    for (const writer of this.chunkWriters.values()) writer.emergencySave();
+    if (this.session) this.sessionManager.emergencySaveAll();
   }
 
-  /**
-   * Get session info for progress messages
-   */
   getSessionInfo() {
     const stats = this.getStats();
     return {
       durationMin: stats.durationMin,
       speakerCount: stats.speakerCount,
       totalSize: stats.totalBytes,
-      estimatedMin: Math.ceil(Math.max(1, (stats.totalBytes / 1024 / 1024 / 6) * 0.5)),
-      participants: stats.participants
+      participants: stats.participants,
     };
   }
 }

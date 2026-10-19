@@ -25,3 +25,11 @@ Thumbs.db
 
 # Test files (optional)
 test-*.js
+
+# Python
+__pycache__/
+
+# Session leftovers
+backups/
+*.mp3
+meeting_counter.txt

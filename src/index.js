@@ -116,7 +116,7 @@ const HELP = `Discord Secretary v${VERSION}
 !recordings — записи за последние 7 дней
 !status — что сейчас делает бот
 
-Расшифровка делается на нашем сервере (Whisper), без внешних сервисов. Сводку пишет Claude.`;
+Расшифровка делается на нашем сервере (Whisper), без внешних сервисов. Сводку пишет OpenAI (gpt-4o-mini).`;
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.content.startsWith('!')) return;

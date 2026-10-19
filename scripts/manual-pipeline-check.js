@@ -1,6 +1,6 @@
 // Manual end-to-end check on the server, without Discord/Telegram:
 //   node scripts/manual-pipeline-check.js <session_dir_with_chunks>
-// Runs WAV conversion + Whisper + timeline, the Claude summary, and the mix.
+// Runs WAV conversion + Whisper + timeline, the OpenAI summary, and the mix.
 // Not part of `npm test` (needs ffmpeg, faster-whisper and an API key).
 import 'dotenv/config';
 import path from 'path';

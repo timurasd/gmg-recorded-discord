@@ -1,219 +1,78 @@
 # GMG Discord Voice Recorder
 
-Discord бот для записи голосовых разговоров с автоматической транскрипцией (Whisper) и саммаризацией (Claude).
+Discord-бот записывает голосовой канал, расшифровывает разговор на нашем сервере (faster-whisper, без внешних сервисов) и присылает в Telegram сводку и расшифровку. Сама запись разговора — по запросу, одним файлом.
 
-## Возможности
+## Команды (в текстовом канале Discord)
 
-- 🎙️ Многоканальная запись (каждый участник записывается отдельно)
-- 📝 Автоматическая транскрипция через локальный faster-whisper (бесплатно)
-- 🤖 Саммаризация через Claude API (участники, темы, решения, action items)
-- 📤 Отправка результатов в Discord и Telegram
-- 🎵 Экспорт WAV файлов для каждого участника
+- `!join` — начать запись голосового канала, в котором ты сейчас. Любое число участников; кто зашёл позже, тоже попадёт в запись.
+- `!leave` — остановить запись. Сводка и расшифровка придут в Telegram (час речи — примерно 30–45 минут обработки).
+- `!audio` — прислать в Telegram запись последнего созвона одним MP3 (`!audio 2` — предпоследнего). Длинные записи приходят частями до 45 МБ.
+- `!recordings` — записи за последние 7 дней с номерами для `!audio`.
+- `!status` — идёт ли запись и обработка.
+- `!help` — справка.
 
-## Требования
+## Что приходит в Telegram
 
-- Node.js 18+
-- Python 3.8+
-- FFmpeg
-- faster-whisper (Python package)
+- 🔴 Запись началась — канал и кто в нём.
+- ⏹️ Запись закончена — дальше это же сообщение показывает прогресс обработки.
+- ✅ Созвон: дата, участники, длительность и сводка текстом, затем файл `transcript_<дата>.txt`. Реплики в расшифровке идут по времени: `[12:03] Тимур: …`.
+- Если сводка не получилась (например, проблема с ключом OpenAI), расшифровка всё равно приходит, с причиной.
 
-## Установка
+## Как это устроено
 
-### 1. Клонировать репо
-
-```bash
-git clone https://github.com/timurasd/gmg-recorded-discord.git
-cd gmg-recorded-discord
+```
+Discord Voice (Opus) → декодирование (prism-media) → PCM каждого участника по кускам
+  + метка начала каждой реплики (src/timeline.js)
+→ WAV 16 kHz → faster-whisper (одна загрузка модели, таймкоды слов, nice -n 10)
+→ реплики всех участников по времени созвона → сводка (OpenAI gpt-4o-mini, один запрос)
+→ Telegram + канал сводок в Discord
 ```
 
-### 2. Установить зависимости
-
-```bash
-# Node.js dependencies
-npm install
-
-# Python dependencies
-pip install faster-whisper
-```
-
-### 3. Настроить `.env`
-
-Скопируй `.env.example` в `.env` и заполни:
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Обязательные переменные:
-- `DISCORD_TOKEN` — токен Discord бота
-- `DISCORD_GUILD_ID` — ID сервера Discord
-- `DISCORD_SUMMARY_CHANNEL_ID` — ID канала для сводок
-- `ANTHROPIC_API_KEY` — Claude API ключ
-- `TELEGRAM_BOT_TOKEN` — токен Telegram бота
-- `TELEGRAM_CHAT_ID` — ID чата Telegram
-
-### 4. Запустить бота
-
-```bash
-npm start
-```
-
-## Использование
-
-1. Зайди в голосовой канал на Discord сервере
-2. В текстовом канале напиши: `!join`
-3. Бот подключится и начнёт запись
-4. Поговори (можно с друзьями, можно один)
-5. Когда закончил — напиши: `!leave`
-6. Жди 1-3 минуты (транскрипция + саммаризация)
-7. Результаты придут в Discord и Telegram:
-   - `summary.txt` — краткая сводка
-   - `transcript.txt` — полная расшифровка
-   - `*.wav` — аудиофайлы каждого участника
-
-## Telegram уведомления
-
-Бот отправляет в Telegram:
-- 🔴 Уведомление о начале записи
-- ⏸️ Уведомление об окончании записи и начале обработки
-- ✅ Уведомление о завершении с файлами:
-  - `summary.txt`
-  - `transcript.txt`
-  - Все WAV файлы участников
-
-## Деплой на сервер
-
-### Через systemd
-
-1. Скопируй файлы на сервер:
-
-```bash
-rsync -avz --exclude 'node_modules' --exclude 'recordings' \
-  -e "ssh -i ~/.ssh/gmg_droplet_deploy" \
-  ./ root@134.209.194.254:/root/apps/gmg-discord-recorder/
-```
-
-2. На сервере установи зависимости:
-
-```bash
-ssh -i ~/.ssh/gmg_droplet_deploy root@134.209.194.254
-cd /root/apps/gmg-discord-recorder
-npm install
-pip install faster-whisper
-```
-
-3. Создай systemd service:
-
-```bash
-nano /etc/systemd/system/gmg-discord-recorder.service
-```
-
-```ini
-[Unit]
-Description=GMG Discord Voice Recorder
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/apps/gmg-discord-recorder
-ExecStart=/usr/bin/npm start
-Restart=always
-RestartSec=10
-StandardOutput=append:/var/log/gmg-discord-recorder.log
-StandardError=append:/var/log/gmg-discord-recorder.error.log
-
-[Install]
-WantedBy=multi-user.target
-```
-
-4. Запусти сервис:
-
-```bash
-systemctl daemon-reload
-systemctl enable gmg-discord-recorder
-systemctl start gmg-discord-recorder
-systemctl status gmg-discord-recorder
-```
-
-## Логи
-
-```bash
-# Локально
-npm start
-
-# На сервере (systemd)
-journalctl -u gmg-discord-recorder -f
-
-# Или файлы логов
-tail -f /var/log/gmg-discord-recorder.log
-tail -f /var/log/gmg-discord-recorder.error.log
-```
-
-## Настройка качества транскрипции
-
-В `.env` измени `WHISPER_MODEL`:
-
-- `tiny` — очень быстро, низкое качество
-- `base` — быстро, средне качество (по умолчанию)
-- `small` — медленнее, хорошее качество ✅ **рекомендуется для русского**
-- `medium` — медленно, отличное качество
-- `large-v3` — очень медленно, максимальное качество
+- Discord присылает звук только пока человек говорит, поэтому у каждого участника в файле одни реплики подряд. Метки «байт в файле → время созвона» возвращают каждое слово на его место, из них же собирается общая дорожка для `!audio` (`src/mix.js`).
+- Сессии хранятся 7 дней (`cleanup.js` по cron в 03:00 UTC): WAV участников, метки, расшифровка, сводка. Сырой PCM удаляется сразу после обработки.
+- Если бот упал или перезапустился посреди созвона, при старте он обработает то, что успело записаться, и пометит расшифровку как прерванную.
+- Сторож (`src/services/watchdog.js`) перезапускает бота, только если связь с Discord пропала дольше 10 минут или кончается память, и никогда во время записи или обработки.
 
 ## Стоимость
 
-- **Транскрипция (Whisper):** БЕСПЛАТНО (работает локально)
-- **Саммаризация (Claude):** ~$0.01 за 30 минут разговора
+- Расшифровка: бесплатно, работает на нашем сервере.
+- Сводка: OpenAI `gpt-4o-mini` (тот же ключ, что у вики и дашборда), доли цента за час созвона. Модель можно сменить переменной `SUMMARY_MODEL`.
 
-## Архитектура
+## Установка
 
-```
-Discord Voice (Opus)
-  ↓
-Декодирование (prism-media)
-  ↓
-PCM аудио (каждый спикер отдельно)
-  ↓
-Конвертация в WAV (ffmpeg)
-  ↓
-Локальная транскрипция (faster-whisper)
-  ↓
-Саммаризация (Claude API)
-  ↓
-Результаты → Discord + Telegram
+```bash
+npm ci
+pip install faster-whisper
+cp .env.example .env   # заполнить токены и ID
+npm test
+npm start
 ```
 
-## Troubleshooting
+Нужны Node.js 20+, Python 3 с faster-whisper, ffmpeg.
 
-### Бот не слышит голос
+`WHISPER_MODEL`: `small` — рекомендуется для русского на нашем сервере (2 CPU); `medium` точнее, но примерно в 2–3 раза медленнее.
 
-- Проверь что говоришь **ПОСЛЕ** `!join`
-- Убедись что микрофон работает в Discord
-- Проверь права бота (Connect, Speak, View Channel)
+## Сервер
 
-### Транскрипция пустая
+Бот работает только через systemd (две копии с одним токеном мешают друг другу и сжигают дневной лимит входов Discord):
 
-- Говори громче и чётче
-- Смени модель на `small` в `.env`
-- Первый раз Whisper загружает модель (~150MB) — потерпи
+```bash
+cp deploy/gmg-discord-recorder.service /etc/systemd/system/
+cp deploy/logrotate-gmg-discord-recorder /etc/logrotate.d/gmg-discord-recorder
+systemctl daemon-reload
+systemctl enable --now gmg-discord-recorder
+```
 
-### Ошибка Claude API
+Логи: `/var/log/gmg-discord-recorder.log`, `/var/log/gmg-discord-recorder.error.log`.
 
-- Проверь баланс на https://console.anthropic.com/
-- Проверь что API ключ правильный в `.env`
+Проверка обработки без Discord и Telegram на сохранённой сессии: `node scripts/manual-pipeline-check.js <папка_сессии>`.
 
-## Лицензия
+## Если что-то не так
 
-MIT
+- **Бот не слышит голос:** говорить после `!join`; у бота должны быть права Connect и View Channel.
+- **Пустая расшифровка:** запись была слишком короткой или тихой.
+- **«Сводку сделать не получилось»:** причина написана в сообщении; чаще всего — ключ или баланс OpenAI (https://platform.openai.com/).
 
 ## Credits
 
-Основано на [discord-secretary-bot](https://github.com/andrew-sidenko/discord-secretary-bot) by Andrew Sidenko
-
-Модифицировано для GMG:
-- Заменён OpenAI Whisper API на локальный faster-whisper
-- Заменён OpenAI GPT на Claude API
-- Добавлены уведомления в Telegram о начале/конце записи
-- Добавлена отправка WAV файлов в Telegram
-- Исправлена отправка длинных summary в Discord
+Основано на [discord-secretary-bot](https://github.com/andrew-sidenko/discord-secretary-bot) by Andrew Sidenko, переработано для GMG.

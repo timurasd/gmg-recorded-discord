@@ -8,20 +8,25 @@
  * - Checksums for integrity verification
  */
 
-import { openSync, writeSync, fdatasyncSync, closeSync, renameSync, statSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
+import { openSync, writeSync, fdatasyncSync, closeSync, renameSync, statSync, existsSync, mkdirSync, readdirSync, unlinkSync, appendFileSync } from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 
 const CHUNK_DURATION_MS = 60000;  // 1-minute chunks
 const SYNC_INTERVAL_MS = 5000;    // Sync every 5 seconds
-const MAX_CHUNKS = 120;           // Max 2 hours of recording
+// Chunks rotate by wall-clock minute while the user talks, so this is ~10 h
+// of meeting per user (was 120 = 2 h, which cut long meetings off).
+const MAX_CHUNKS = 600;
 
 export class ChunkWriter {
   constructor(sessionDir, userId) {
     this.sessionDir = sessionDir;
     this.userId = userId;
     this.chunksDir = path.join(sessionDir, 'chunks', userId);
+    // Utterance markers live outside chunks/ so they outlast the raw PCM,
+    // which is deleted once the session is processed (see timeline.js).
+    this.markersPath = markersPath(sessionDir, userId);
     
     this.currentChunkIndex = 0;
     this.currentChunkFd = null;
@@ -35,6 +40,7 @@ export class ChunkWriter {
     
     // Ensure chunks directory exists
     mkdirSync(this.chunksDir, { recursive: true });
+    mkdirSync(path.dirname(this.markersPath), { recursive: true });
     
     // Find existing chunks to continue numbering
     this._findLastChunkIndex();
@@ -116,6 +122,18 @@ export class ChunkWriter {
     } catch (err) {
       console.error(`[ChunkWriter] Write error for user ${this.userId}:`, err.message);
       return false;
+    }
+  }
+
+  /**
+   * An utterance starts here: remember where it begins in this user's audio
+   * (byte offset) and when it was said (ms since the recording started).
+   */
+  mark(meetingMs) {
+    try {
+      appendFileSync(this.markersPath, JSON.stringify({ byte: this.totalBytesWritten, ms: meetingMs }) + '\n');
+    } catch (err) {
+      console.error(`[ChunkWriter] Marker write error for user ${this.userId}:`, err.message);
     }
   }
 
@@ -216,15 +234,7 @@ export class ChunkWriter {
    * Get all completed chunk paths for this user
    */
   getCompletedChunks() {
-    try {
-      const files = readdirSync(this.chunksDir);
-      return files
-        .filter(f => f.endsWith('.complete'))
-        .sort()
-        .map(f => path.join(this.chunksDir, f));
-    } catch (err) {
-      return [];
-    }
+    return listChunkFiles(this.chunksDir);
   }
 
   /**
@@ -245,26 +255,90 @@ export class ChunkWriter {
    * Concatenate all chunks into single PCM file
    */
   async concatenateChunks(outputPath) {
-    const chunks = this.getCompletedChunks();
-    if (chunks.length === 0) {
-      throw new Error('No completed chunks to concatenate');
-    }
-
-    const outputFd = openSync(outputPath, 'w');
-    let totalBytes = 0;
-
-    for (const chunkPath of chunks) {
-      const data = await fs.readFile(chunkPath);
-      writeSync(outputFd, data);
-      totalBytes += data.length;
-    }
-
-    fdatasyncSync(outputFd);
-    closeSync(outputFd);
-
-    console.log(`[ChunkWriter] Concatenated ${chunks.length} chunks into ${outputPath} (${(totalBytes / 1024 / 1024).toFixed(2)} MB)`);
-    return totalBytes;
+    return concatenateChunkFiles(this.getCompletedChunks(), outputPath);
   }
+}
+
+export function markersPath(sessionDir, userId) {
+  return path.join(sessionDir, 'markers', `${userId}.jsonl`);
+}
+
+/** Markers matching the processed audio (with utterance gaps), used by !audio. */
+export function wavMarkersPath(sessionDir, userId) {
+  return path.join(sessionDir, 'markers', `${userId}.wav.jsonl`);
+}
+
+/**
+ * A user's chunk files in recording order: finished ones, plus the one cut off
+ * by a crash (.partial after recovery) -- it holds real audio too.
+ */
+export function listChunkFiles(chunksDir) {
+  try {
+    return readdirSync(chunksDir)
+      .filter(f => /^chunk_\d+\.pcm\.(complete|partial)$/.test(f))
+      .sort()
+      .map(f => path.join(chunksDir, f));
+  } catch (err) {
+    return [];
+  }
+}
+
+/**
+ * Concatenate chunk files, putting `gapBytes` of silence before each marker
+ * byte offset after the first byte -- see timeline.js markersWithGaps(), which
+ * gives the markers for the resulting file. Streams chunk by chunk.
+ */
+export async function concatenateChunkFilesWithGaps(chunks, outputPath, markers, gapBytes) {
+  if (chunks.length === 0) throw new Error('No completed chunks to concatenate');
+  const gapAt = markers.map(m => m.byte).filter(b => b > 0).sort((a, b) => a - b);
+  const silence = Buffer.alloc(gapBytes);
+  const outputFd = openSync(outputPath, 'w');
+  let offset = 0; // position in the original (gapless) audio
+  let next = 0;   // next gap in gapAt
+
+  for (const chunkPath of chunks) {
+    const data = await fs.readFile(chunkPath);
+    let pos = 0;
+    while (pos < data.length) {
+      while (next < gapAt.length && gapAt[next] <= offset) {
+        writeSync(outputFd, silence);
+        next++;
+      }
+      const until = next < gapAt.length ? Math.min(data.length, pos + (gapAt[next] - offset)) : data.length;
+      writeSync(outputFd, data.subarray(pos, until));
+      offset += until - pos;
+      pos = until;
+    }
+  }
+
+  fdatasyncSync(outputFd);
+  closeSync(outputFd);
+  console.log(`[ChunkWriter] Concatenated ${chunks.length} chunks with ${next} utterance gap(s) into ${outputPath}`);
+  return offset;
+}
+
+/**
+ * Concatenate chunk files into a single PCM file
+ */
+export async function concatenateChunkFiles(chunks, outputPath) {
+  if (chunks.length === 0) {
+    throw new Error('No completed chunks to concatenate');
+  }
+
+  const outputFd = openSync(outputPath, 'w');
+  let totalBytes = 0;
+
+  for (const chunkPath of chunks) {
+    const data = await fs.readFile(chunkPath);
+    writeSync(outputFd, data);
+    totalBytes += data.length;
+  }
+
+  fdatasyncSync(outputFd);
+  closeSync(outputFd);
+
+  console.log(`[ChunkWriter] Concatenated ${chunks.length} chunks into ${outputPath} (${(totalBytes / 1024 / 1024).toFixed(2)} MB)`);
+  return totalBytes;
 }
 
 /**

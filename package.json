@@ -1,12 +1,13 @@
 {
   "name": "discord-secretary-bot",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "description": "Discord voice meeting bot with multichannel recording, speaker diarization, transcription, and summary delivery",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --inspect src/index.js"
+    "dev": "node --inspect src/index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.123.0",

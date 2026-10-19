@@ -1,118 +1,90 @@
 /**
- * Watchdog - Health monitoring and self-healing
- * 
- * Features:
- * - Heartbeat monitoring
- * - Memory usage tracking
- * - Event loop lag detection
- * - Auto-restart on freeze
+ * Watchdog - restarts the bot only when it is really stuck.
+ *
+ * The old version expected a "heartbeat" that only came from Discord chat
+ * messages: two minutes without anyone typing and it killed the process --
+ * mid-recording, mid-transcription, and every 2 minutes when idle. That made
+ * ~650 Discord logins a day (2026-10-19: 14,000+ restarts) and nothing longer
+ * than 2 minutes was ever recorded.
+ *
+ * Now it looks at what matters: the Discord connection (discord.js reconnects
+ * on its own; we step in only if it stays down for long) and memory. It never
+ * restarts while a recording or its processing is running.
  */
 
-const WATCHDOG_TIMEOUT = 60000;  // 1 minute without heartbeat = frozen
-const CHECK_INTERVAL = 10000;    // Check every 10 sec
-const MEMORY_LIMIT_MB = 400;     // Restart if exceeds
+const CHECK_INTERVAL_MS = 30_000;
+const DISCONNECT_LIMIT_MS = 10 * 60_000;
+const MEMORY_LIMIT_MB = 400;
+const HEALTH_LOG_EVERY_MS = 10 * 60_000;
 
 export class Watchdog {
-  constructor(options = {}) {
-    this.timeout = options.timeout || WATCHDOG_TIMEOUT;
-    this.checkInterval = options.checkInterval || CHECK_INTERVAL;
-    this.memoryLimit = options.memoryLimit || MEMORY_LIMIT_MB;
-    this.onTimeout = options.onTimeout || (() => process.exit(1));
-    
-    this.lastHeartbeat = Date.now();
-    this.lastEventLoopCheck = Date.now();
+  constructor({ isConnected, isBusy, onFatal, checkInterval = CHECK_INTERVAL_MS, disconnectLimit = DISCONNECT_LIMIT_MS, memoryLimit = MEMORY_LIMIT_MB }) {
+    this.isConnected = isConnected;
+    this.isBusy = isBusy;
+    this.onFatal = onFatal;
+    this.checkInterval = checkInterval;
+    this.disconnectLimit = disconnectLimit;
+    this.memoryLimit = memoryLimit;
+    this.disconnectedSince = null;
+    this.lastHealthLog = 0;
+    this.lastCheck = Date.now();
     this.interval = null;
-    this.isRunning = false;
   }
 
-  /**
-   * Start watchdog monitoring
-   */
   start() {
-    if (this.isRunning) return;
-    
-    this.isRunning = true;
-    this.lastHeartbeat = Date.now();
-    
-    this.interval = setInterval(() => {
-      this._check();
-    }, this.checkInterval);
-
-    // Don't keep process alive just for watchdog
+    if (this.interval) return;
+    this.lastCheck = Date.now();
+    this.interval = setInterval(() => this._check(), this.checkInterval);
     this.interval.unref();
-    
     console.log('[Watchdog] Started monitoring');
   }
 
-  /**
-   * Stop watchdog
-   */
   stop() {
-    if (this.interval) {
-      clearInterval(this.interval);
-      this.interval = null;
-    }
-    this.isRunning = false;
-    console.log('[Watchdog] Stopped');
+    if (this.interval) clearInterval(this.interval);
+    this.interval = null;
   }
 
-  /**
-   * Signal that process is alive
-   */
-  kick() {
-    this.lastHeartbeat = Date.now();
-  }
-
-  /**
-   * Perform health check
-   */
   _check() {
     const now = Date.now();
-    
-    // Check heartbeat
-    const elapsed = now - this.lastHeartbeat;
-    if (elapsed > this.timeout) {
-      console.error(`[Watchdog] ❌ No heartbeat for ${elapsed}ms, triggering timeout handler`);
-      this.onTimeout();
-      return;
+    const lag = now - this.lastCheck - this.checkInterval;
+    this.lastCheck = now;
+    const busy = this.isBusy();
+
+    if (this.isConnected()) {
+      if (this.disconnectedSince) console.log('[Watchdog] Discord connection is back');
+      this.disconnectedSince = null;
+    } else {
+      this.disconnectedSince ??= now;
+      const downMs = now - this.disconnectedSince;
+      if (downMs > this.disconnectLimit && !busy) {
+        this.onFatal(`no Discord connection for ${Math.round(downMs / 60_000)} min`);
+        return;
+      }
     }
 
-    // Check memory usage
-    const memUsage = process.memoryUsage();
-    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-    const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
-    const rssMB = Math.round(memUsage.rss / 1024 / 1024);
-    
-    if (heapUsedMB > this.memoryLimit) {
-      console.error(`[Watchdog] ❌ Memory limit exceeded: ${heapUsedMB}MB / ${this.memoryLimit}MB`);
-      this.onTimeout();
-      return;
+    const heapMb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+    if (heapMb > this.memoryLimit) {
+      if (!busy) {
+        this.onFatal(`memory ${heapMb} MB over ${this.memoryLimit} MB`);
+        return;
+      }
+      console.warn(`[Watchdog] Memory ${heapMb} MB over the limit, waiting for the recording to finish`);
     }
 
-    // Check event loop lag
-    const eventLoopLag = now - this.lastEventLoopCheck - this.checkInterval;
-    this.lastEventLoopCheck = now;
-    
-    if (eventLoopLag > 1000) {
-      console.warn(`[Watchdog] ⚠️ Event loop lag: ${eventLoopLag}ms`);
+    if (lag > 5000) console.warn(`[Watchdog] Event loop lag: ${lag} ms`);
+    if (now - this.lastHealthLog >= HEALTH_LOG_EVERY_MS) {
+      this.lastHealthLog = now;
+      console.log(`[Watchdog] OK - heap ${heapMb} MB, connected: ${!this.disconnectedSince}, busy: ${busy}`);
     }
-
-    // Log health status periodically
-    console.log(`[Watchdog] ✓ Health OK - Memory: ${heapUsedMB}MB heap, ${rssMB}MB RSS, Event loop lag: ${eventLoopLag}ms`);
   }
 
-  /**
-   * Get current health status
-   */
   getStatus() {
-    const memUsage = process.memoryUsage();
+    const mem = process.memoryUsage();
     return {
       uptime: process.uptime(),
-      heapUsedMB: Math.round(memUsage.heapUsed / 1024 / 1024),
-      heapTotalMB: Math.round(memUsage.heapTotal / 1024 / 1024),
-      rssMB: Math.round(memUsage.rss / 1024 / 1024),
-      lastHeartbeat: this.lastHeartbeat,
-      isHealthy: (Date.now() - this.lastHeartbeat) < this.timeout
+      heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+      heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+      connected: this.isConnected(),
     };
   }
 }

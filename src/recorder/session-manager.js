@@ -316,10 +316,11 @@ export function updateSessionFile(sessionDir, patch) {
 }
 
 /**
- * Processed sessions still on disk (the daily cleanup deletes them after 7
- * days), newest first -- for !recordings and !audio.
+ * Sessions in a given state still on disk (the daily cleanup deletes them
+ * after 7 days), newest first -- completed ones for !recordings and !audio,
+ * failed ones for !retry.
  */
-export function listProcessedSessions(baseDir) {
+export function listProcessedSessions(baseDir, state = SESSION_STATES.COMPLETED) {
   const sessions = [];
   try {
     for (const entry of readdirSync(baseDir, { withFileTypes: true })) {
@@ -327,7 +328,7 @@ export function listProcessedSessions(baseDir) {
       const dir = path.join(baseDir, entry.name);
       try {
         const session = JSON.parse(readFileSync(path.join(dir, 'session.json'), 'utf-8'));
-        if (session.state === SESSION_STATES.COMPLETED) sessions.push({ ...session, dir });
+        if (session.state === state) sessions.push({ ...session, dir });
       } catch {
         // no or broken session.json -- not a processed session
       }

@@ -1,6 +1,6 @@
 {
   "name": "discord-secretary-bot",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Discord voice meeting bot with multichannel recording, speaker diarization, transcription, and summary delivery",
   "main": "src/index.js",
   "type": "module",

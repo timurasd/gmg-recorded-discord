@@ -9,6 +9,7 @@ src/timeline.js расставляет реплики участников по 
 Usage: whisper_transcribe.py <language> <model_size> <audio_file> [<audio_file> ...]
 Stdout: {"files": {"<audio_file>": {"segments": [{"start", "end", "text"}], "duration"}}}
 """
+import gc
 import json
 import sys
 
@@ -60,6 +61,9 @@ def main(argv):
         except Exception as e:  # one bad file shouldn't lose the others
             print(f"Error on {audio_file}: {e}", file=sys.stderr)
             out[audio_file] = {"segments": [], "duration": 0, "error": str(e)}
+        # Give the decoded audio back before the next piece (memory on this
+        # droplet is tight, see pieceRanges in src/timeline.js).
+        gc.collect()
 
     print(json.dumps({"files": out}, ensure_ascii=False))
     return 0

@@ -114,8 +114,73 @@ export function mergeSegments(users, joinGapMs = 3000) {
       }
     }
   }
-  for (const line of lines) line.text = line.text.trim();
-  return lines.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+  for (const line of lines) line.text = stripHallucinations(line.text);
+  return lines.filter((l) => l.text).sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+}
+
+/**
+ * Where to cut a user's audio into pieces of at most `maxPieceSec` for
+ * Whisper, whose memory grows with file length (2026-10-21: 80 min of one
+ * speaker took 4 GB and was OOM-killed; 10 min takes 1.4 GB). Cuts go in the
+ * middle of the silence inserted before an utterance (markersWithGaps), so no
+ * word is split. Returns [{ start, end }] in seconds of the file.
+ */
+export function pieceRanges(fileMarkers, totalSec, maxPieceSec = 600, gapBytes = UTTERANCE_GAP_BYTES) {
+  const cuts = fileMarkers
+    .filter((m) => m.byte >= gapBytes)
+    .map((m) => (m.byte - gapBytes / 2) / (PCM_BYTES_PER_MS * 1000))
+    .filter((s) => s > 0 && s < totalSec)
+    .sort((a, b) => a - b);
+
+  const ranges = [];
+  let start = 0;
+  while (totalSec - start > maxPieceSec) {
+    // the last silence that still keeps this piece under the limit
+    let cut = null;
+    for (const c of cuts) {
+      if (c <= start) continue;
+      if (c - start > maxPieceSec) break;
+      cut = c;
+    }
+    if (cut === null) cut = start + maxPieceSec; // one utterance longer than a piece
+    ranges.push({ start, end: cut });
+    start = cut;
+  }
+  ranges.push({ start, end: totalSec });
+  return ranges;
+}
+
+/** Whisper segments of a piece starting `offsetSec` into the file -> file times. */
+export function shiftSegments(segments, offsetSec) {
+  if (!offsetSec) return segments;
+  const r = (x) => Math.round((x + offsetSec) * 100) / 100;
+  return segments.map((s) => ({
+    ...s,
+    start: r(s.start),
+    end: r(s.end),
+    ...(Array.isArray(s.words) ? { words: s.words.map(([a, b, w]) => [r(a), r(b), w]) } : {}),
+  }));
+}
+
+// Phrases Whisper "hears" in Russian at the end of a stretch of audio -- credits
+// from the subtitles it was trained on (seen 2026-10-21: "Редактор субтитров
+// И.Бойкова" tacked onto a real sentence). Removed from the transcript.
+// A credited name: optional initials ("И.", "А. ") then a surname or nickname.
+const NAME = String.raw`(?:\s*(?:[А-ЯЁA-Z]\.\s*)*[A-Za-zА-ЯЁа-яё-]+)?`;
+const HALLUCINATIONS = [
+  new RegExp(String.raw`Редактор субтитров${NAME}[.!?]?`, 'gi'),
+  new RegExp(String.raw`Корректор\s+(?:[А-ЯЁ]\.\s*)+[А-ЯЁ][а-яё]+[.!?]?`, 'g'),
+  new RegExp(String.raw`Субтитры\s+(?:сделал|создавал|делал|подготовил|подогнал)${NAME}[.!?]?`, 'gi'),
+  new RegExp(String.raw`Субтитры\s+(?:от|by)${NAME}[.!?]?`, 'gi'),
+  /Продолжение следует\.{0,3}/gi,
+  /Спасибо за просмотр[!.]?/gi,
+  /DimaTorzok/gi,
+];
+
+export function stripHallucinations(text) {
+  let out = String(text);
+  for (const re of HALLUCINATIONS) out = out.replace(re, ' ');
+  return out.replace(/\s{2,}/g, ' ').trim();
 }
 
 /** 00:05 / 01:02:03 */

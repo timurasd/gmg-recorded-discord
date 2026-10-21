@@ -5,7 +5,7 @@ import { promisify } from 'util';
 import { ensureDir } from './utils.js';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import { mergeSegments } from './timeline.js';
+import { mergeSegments, pieceRanges, shiftSegments, PCM_BYTES_PER_MS } from './timeline.js';
 
 const exec = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -89,18 +89,43 @@ export async function transcribeSession(users, sessionDir, onProgress = null) {
   }
   if (ready.length === 0) throw new Error('Нет аудио для расшифровки.');
 
+  // Long tracks go to Whisper in pieces of up to 10 min, cut in the pauses
+  // between utterances: its memory grows with file length.
+  const pieces = [];
+  for (const user of ready) {
+    const totalSec = (await fs.stat(user.pcmFile)).size / (PCM_BYTES_PER_MS * 1000);
+    const ranges = pieceRanges(user.markers, totalSec, Number(process.env.WHISPER_PIECE_SEC) || 600);
+    if (ranges.length === 1) {
+      pieces.push({ user, file: user.wavFile, offsetSec: 0 });
+      continue;
+    }
+    for (const [i, { start, end }] of ranges.entries()) {
+      const file = path.join(transcriptsDir, `${user.userId}.part${i}.wav`);
+      await exec('ffmpeg', ['-loglevel', 'error', '-y', '-i', user.wavFile, '-ss', String(start), '-to', String(end), '-c:a', 'pcm_s16le', file]);
+      pieces.push({ user, file, offsetSec: start, temp: true });
+    }
+    console.log(`✂️ ${user.name}: ${Math.round(totalSec / 60)} min of audio in ${ranges.length} pieces`);
+  }
+
   const language = process.env.WHISPER_LANGUAGE || 'ru';
   const modelSize = process.env.WHISPER_MODEL || 'small';
-  console.log(`📝 Transcribing ${ready.length} user(s) with Whisper ${modelSize}...`);
+  console.log(`📝 Transcribing ${ready.length} user(s), ${pieces.length} piece(s), with Whisper ${modelSize}...`);
 
-  const results = await runWhisper(ready.map((u) => u.wavFile), language, modelSize, async (i) => {
-    if (onProgress) await onProgress(Math.round((i / ready.length) * 90), ready[i].name);
-  });
+  let results;
+  try {
+    results = await runWhisper(pieces.map((p) => p.file), language, modelSize, async (i) => {
+      if (onProgress) await onProgress(Math.round((i / pieces.length) * 90), pieces[i].user.name);
+    });
+  } finally {
+    for (const p of pieces) if (p.temp) await fs.rm(p.file, { force: true });
+  }
 
   const lines = mergeSegments(ready.map((u) => ({
     name: u.name,
     markers: u.markers,
-    segments: results[u.wavFile]?.segments || [],
+    segments: pieces
+      .filter((p) => p.user === u)
+      .flatMap((p) => shiftSegments(results[p.file]?.segments || [], p.offsetSec)),
   })));
   console.log(`📊 Transcript: ${lines.length} line(s)`);
   if (lines.length === 0) {

@@ -23,7 +23,9 @@ import { sendResults, updateProgress, formatDuration, formatMoscowTime } from '.
  */
 export async function processSession({ sessionId, sessionDir, startTime, endTime, users, participants, interrupted = false, progressMessageId = null }) {
   const durationSec = Math.max(1, Math.round((endTime - startTime) / 1000));
-  updateSessionFile(sessionDir, { state: 'processing', endTime });
+  // Counted so recovery stops re-running a job that keeps killing the bot.
+  const before = updateSessionFile(sessionDir, {});
+  updateSessionFile(sessionDir, { state: 'processing', endTime, processingAttempts: (before?.processingAttempts || 0) + 1 });
 
   try {
     // A chunk still open when the connection dropped or the bot crashed is

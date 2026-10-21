@@ -20,6 +20,12 @@ Restart=always
 RestartSec=30
 # Let an emergency save finish on stop.
 TimeoutStopSec=30
+# Whisper runs inside this unit. On 2026-10-21 it grew to 4 GB, the kernel
+# OOM-killed it and other services' processes, and systemd then restarted the
+# whole bot. Cap the unit so only it hits the wall, and keep the bot running
+# when its Whisper child is killed -- it reports the failure in Telegram.
+MemoryMax=3500M
+OOMPolicy=continue
 StandardOutput=append:/var/log/gmg-discord-recorder.log
 StandardError=append:/var/log/gmg-discord-recorder.error.log
 

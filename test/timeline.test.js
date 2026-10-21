@@ -86,3 +86,35 @@ test('words place a stitched Whisper segment back into its two utterances', () =
     [60200, 'Андрей', 'Пока.'],
   ]);
 });
+
+test('pieceRanges cuts long audio in the pauses between utterances, under the limit', async () => {
+  const { pieceRanges, markersWithGaps, PCM_BYTES_PER_MS } = await import('../src/timeline.js');
+  const sec = PCM_BYTES_PER_MS * 1000;
+  // utterances starting every 4 min of audio, 25 min in total
+  const raw = [0, 240, 480, 720, 960, 1200, 1440].map((s, i) => ({ byte: s * sec, ms: i * 600000 }));
+  const fileMarkers = markersWithGaps(raw);
+  const total = 1500 + 6; // + six 1 s gaps
+  const ranges = pieceRanges(fileMarkers, total, 600);
+  assert.ok(ranges.every((r) => r.end - r.start <= 600));
+  assert.equal(ranges[0].start, 0);
+  assert.equal(ranges[ranges.length - 1].end, total);
+  // every cut is in the middle of an inserted second of silence
+  for (const r of ranges.slice(1)) assert.ok(fileMarkers.some((m) => Math.abs(m.byte / sec - 0.5 - r.start) < 1e-9));
+  assert.deepEqual(pieceRanges(fileMarkers, 300, 600), [{ start: 0, end: 300 }]);
+});
+
+test('shiftSegments moves a piece back to file time, words included', async () => {
+  const { shiftSegments } = await import('../src/timeline.js');
+  assert.deepEqual(shiftSegments([{ start: 1, end: 2, text: 'а', words: [[1, 2, ' а']] }], 600.5), [
+    { start: 601.5, end: 602.5, text: 'а', words: [[601.5, 602.5, ' а']] },
+  ]);
+});
+
+test('subtitle-credit hallucinations are cut out, real words kept', async () => {
+  const { stripHallucinations, mergeSegments } = await import('../src/timeline.js');
+  assert.equal(stripHallucinations('Ага, вот что... Редактор субтитров И.Бойкова'), 'Ага, вот что...');
+  assert.equal(stripHallucinations('Продолжение следует... Субтитры сделал DimaTorzok'), '');
+  assert.equal(stripHallucinations('Нужен корректор текста для постов.'), 'Нужен корректор текста для постов.');
+  const lines = mergeSegments([{ name: 'А', markers: [], segments: [{ start: 0, end: 1, text: 'Спасибо за просмотр!' }] }]);
+  assert.deepEqual(lines, []);
+});

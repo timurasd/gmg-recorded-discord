@@ -3,7 +3,7 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 import { joinVoiceChannel } from '@discordjs/voice';
 import { SessionManager, updateSessionFile, listProcessedSessions } from './recorder/session-manager.js';
 import { AudioRecorder } from './recorder/audio-recorder.js';
-import { RecoveryService } from './services/recovery.js';
+import { RecoveryService, buildJobFromSession } from './services/recovery.js';
 import { Watchdog } from './services/watchdog.js';
 import { processSession } from './pipeline.js';
 import { buildMixedAudio } from './mix.js';
@@ -13,7 +13,7 @@ import {
 } from './delivery.js';
 import { ensureDir } from './utils.js';
 
-const VERSION = '3.0.0';
+const VERSION = '3.1.0';
 const LOGIN_RETRY_DELAY_MS = 5 * 60_000;
 
 const recordingsDir = process.env.AUDIO_OUTPUT_DIR || './recordings';
@@ -101,7 +101,11 @@ client.once(Events.ClientReady, () => {
   }
 
   // Meetings cut off by a crash/restart still get a transcript.
-  for (const job of recoveryService.runRecovery()) enqueue(() => runProcessing(job, null));
+  const { toProcess, gaveUp } = recoveryService.runRecovery();
+  for (const job of toProcess) enqueue(() => runProcessing(job, null));
+  for (const s of gaveUp) {
+    sendTelegramText(`⚠️ Обработка записи от ${escapeHtml(formatMoscowTime(s.startTime))} дважды прервалась, автоматически больше не запускаю. Звук сохранён — повторить: <code>!retry</code> в Discord.`);
+  }
 
   watchdog.start();
   console.log('[Startup] Bot ready for commands');
@@ -114,6 +118,7 @@ const HELP = `Discord Secretary v${VERSION}
 !leave — остановить запись; сводка и расшифровка придут в Telegram
 !audio — прислать в Telegram запись последнего созвона одним файлом (!audio 2 — предпоследнего)
 !recordings — записи за последние 7 дней
+!retry — заново обработать последнюю запись, обработка которой не удалась (звук хранится 7 дней)
 !status — что сейчас делает бот
 
 Расшифровка делается на нашем сервере (Whisper), без внешних сервисов. Сводку пишет OpenAI (gpt-4o-mini).`;
@@ -176,6 +181,18 @@ client.on(Events.MessageCreate, async (message) => {
       console.error('[Command] !leave error:', err);
       await message.reply(`Ошибка при остановке: ${err.message}`);
     }
+    return;
+  }
+
+  if (command === 'retry') {
+    if (busyJobs > 0) return message.reply('Сейчас идёт другая обработка — повтори, когда она закончится (!status).');
+    const job = listProcessedSessions(recordingsDir, 'failed').map(buildJobFromSession).find(Boolean);
+    if (!job) return message.reply('Нет записей с неудачной обработкой, у которых сохранился звук.');
+    console.log(`[Command] !retry - ${job.sessionId}`);
+    await message.reply(`Заново обрабатываю запись от ${formatMoscowTime(job.startTime)}. Результат придёт в Telegram.`);
+    const minutes = Math.round((job.endTime - job.startTime) / 60000);
+    const progressMessageId = await notifyRecordingEnd({ durationMin: minutes, speakerCount: job.users.length });
+    enqueue(() => runProcessing({ ...job, progressMessageId }, message));
     return;
   }
 

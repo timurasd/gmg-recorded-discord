@@ -18,6 +18,28 @@ import { parseMarkers, formatTranscript, markersWithGaps, UTTERANCE_GAP_BYTES } 
 import { sendResults, updateProgress, formatDuration, formatMoscowTime } from './delivery.js';
 
 /**
+ * Summary + transcript of every meeting, kept for good in archive/ (the
+ * session folder with the audio goes after 7 days). Andrew wants the
+ * transcripts readable later, on request, to fill the project knowledge base
+ * (2026-10-22). One text file per meeting, ~100 KB.
+ */
+export async function archiveText({ startTime, summary, summaryError, transcript }) {
+  try {
+    const dir = process.env.ARCHIVE_DIR || './archive';
+    await fs.mkdir(dir, { recursive: true });
+    // Moscow wall clock in the name: call_2026-10-21_14-05.txt
+    const stamp = new Date(startTime + 3 * 3600_000).toISOString().slice(0, 16).replace('T', '_').replace(':', '-');
+    let file = path.join(dir, `call_${stamp}.txt`);
+    if (existsSync(file)) file = path.join(dir, `call_${stamp}_${Date.now()}.txt`);
+    const summaryBlock = summary || `(сводки нет: ${summaryError || 'неизвестная ошибка'})`;
+    await fs.writeFile(file, `СВОДКА\n\n${summaryBlock}\n\n\nРАСШИФРОВКА\n\n${transcript}`, 'utf-8');
+    console.log(`[Pipeline] Archived to ${file}`);
+  } catch (err) {
+    console.error('[Pipeline] Archive write failed:', err.message); // never blocks delivery
+  }
+}
+
+/**
  * users: [{ userId, name }]; chunks are read from <sessionDir>/chunks/<userId>.
  * Throws when there is nothing to transcribe; the caller reports it.
  */
@@ -68,6 +90,7 @@ export async function processSession({ sessionId, sessionDir, startTime, endTime
       durationText: formatDuration(durationSec),
     });
     if (summary) await fs.writeFile(path.join(sessionDir, 'summary.txt'), summary, 'utf-8');
+    await archiveText({ startTime, summary, summaryError, transcript });
 
     await sendResults({
       transcriptPath,

@@ -33,3 +33,6 @@ __pycache__/
 backups/
 *.mp3
 meeting_counter.txt
+
+# Permanent transcript archive (server only)
+archive/

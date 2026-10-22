@@ -59,3 +59,21 @@ test('utterance gaps land exactly at the markers, also across chunk files', asyn
   // shifted markers point at the first byte of each utterance in the new file
   assert.deepEqual(markersWithGaps(markers, 2).map((m) => m.byte), [0, 5, 10]);
 });
+
+test('archiveText keeps summary + transcript as call_<Moscow time>.txt', async () => {
+  const { mkdtempSync, readFileSync, readdirSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'arch-'));
+  process.env.ARCHIVE_DIR = dir;
+  const { archiveText } = await import('../src/pipeline.js');
+  // 2026-10-21 11:05 UTC = 14:05 МСК
+  await archiveText({ startTime: Date.UTC(2026, 9, 21, 11, 5), summary: 'Кратко: тест.', transcript: '[00:01] А: привет\n' });
+  await archiveText({ startTime: Date.UTC(2026, 9, 21, 11, 5), summary: null, summaryError: 'нет ключа', transcript: 'x\n' });
+  const files = readdirSync(dir).sort();
+  assert.equal(files[0], 'call_2026-10-21_14-05.txt');
+  assert.equal(files.length, 2); // same minute -> second file gets a suffix, nothing overwritten
+  const text = readFileSync(path.join(dir, files[0]), 'utf-8');
+  assert.ok(text.startsWith('СВОДКА\n\nКратко: тест.') && text.includes('РАСШИФРОВКА\n\n[00:01] А: привет'));
+  delete process.env.ARCHIVE_DIR;
+});

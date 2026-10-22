@@ -13,7 +13,7 @@ import {
 } from './delivery.js';
 import { ensureDir } from './utils.js';
 
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 const LOGIN_RETRY_DELAY_MS = 5 * 60_000;
 
 const recordingsDir = process.env.AUDIO_OUTPUT_DIR || './recordings';
